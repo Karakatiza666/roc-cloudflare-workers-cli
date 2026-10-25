@@ -1,0 +1,2 @@
+[tools]
+roc-cfw = { ref = "Karakatiza666/roc-cloudflare-workers-cli@^1", url = "https://example.com/cli/releases/download/1.0.3/CLIHASH.tar.zst" }

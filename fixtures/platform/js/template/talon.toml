@@ -1,0 +1,4 @@
+# The [scripts] table that `roc-cfw init` adds to the talon.toml of a new project (the [tools] table stays as it is).
+[scripts]
+build = ["roc build --target=wasm32 --no-cache --output=app.wasm main.roc", "roc-cfw sync"]
+dev = ["@build", "wrangler dev --local"]

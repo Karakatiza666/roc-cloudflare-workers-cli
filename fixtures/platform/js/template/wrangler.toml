@@ -1,0 +1,6 @@
+name = "roc-hello"
+main = "worker.js"
+# For a deploy: `wrangler d1 create roc-hello`, and put its id here.
+[[d1_databases]]
+binding = "DB"
+database_name = "roc-hello"
