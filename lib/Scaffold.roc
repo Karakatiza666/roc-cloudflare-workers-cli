@@ -1,4 +1,6 @@
 import header.Header
+import toml.Toml
+import toml.Value
 
 ## The pure part of `roc-cfw init`: how the 4 files of the template (`js/template/` of the platform bundle) join the files that
 ## `tln init --platform` and `tln add --tool` made. A function gives the new text, or says why it cannot.
@@ -7,7 +9,7 @@ import header.Header
 ## | --- | --- |
 ## | `main.roc` | Keep the header of the file, put the template (a body with no header) after it. Only when the body is still the stub (empty, or with `crash "write the app"`, Talon R-IN8) |
 ## | `wrangler.toml` | The template, with the name of the project. No file is there before |
-## | `talon.toml` | Add the `[scripts]` table of the template at the end. `[tools]` and all other bytes stay. No `[scripts]` table is there before |
+## | `talon.toml` | Merge the `[scripts]` table of the template with roc-toml: add each key that is missing, keep each key that is there. All other bytes stay |
 ## | `.gitignore` | Add each line of the template that the file does not have |
 Scaffold :: [].{
 
@@ -74,21 +76,57 @@ Scaffold :: [].{
 			.replace_each("wrangler d1 create ${old}", "wrangler d1 create ${args.name}")
 	}
 
-	## `existing` with the `[scripts]` table of `template` at its end. `HasScripts` when `existing` has the table.
-	## `NoScripts` when `template` has none.
-	scripts : { existing : Str, template : Str } -> Try(Str, [HasScripts, NoScripts])
+	## `existing` (a `talon.toml`) with the `[scripts]` keys of `template`. The keys go in the order of the template text.
+	##
+	## | `existing` | Result |
+	## | --- | --- |
+	## | Empty | The `[scripts]` table of `template` as it is |
+	## | Does not parse | `BadToml` with the line and column |
+	## | Has `scripts` that is not a table | `ScriptsNotTable` |
+	## | A key is missing | `Toml.insert` adds it. All other bytes stay (a `[scripts]` table is made at the end when there is none) |
+	## | A key has the template value | No change |
+	## | A key has another value | The value of `existing` stays. The key is in `kept` |
+	##
+	## `NoScripts` and `BadTemplate`: `template` has no `[scripts]` table, or does not parse.
+	scripts : { existing : Str, template : Str } -> Try({ text : Str, kept : List(Str) }, [BadToml({ line : U64, column : U64, message : Str }), ScriptsNotTable, NoScripts, BadTemplate])
 	scripts = |files| {
-		if has_scripts(files.existing) {
-			return Err(HasScripts)
-		}
-		table = scripts_table(files.template)?
+		wanted = template_scripts(files.template)?
 		if files.existing.trim() == "" {
-			Ok(table)
-		} else {
-			kept = if files.existing.ends_with("\n") files.existing else "${files.existing}\n"
-			Ok("${kept}\n${table}")
+			table = scripts_table(files.template)?
+			return Ok({ text: table, kept: [] })
 		}
+		doc = match Toml.parse(files.existing) {
+			Ok(d) => d
+			Err(TomlErr(e)) => return Err(BadToml(e))
+		}
+		present = match doc.get(["scripts"]) {
+			Err(NotFound) => Dict.empty()
+			Ok(Table(d)) => d
+			Ok(_) => return Err(ScriptsNotTable)
+		}
+		var $doc = doc
+		var $kept = []
+		for (key, value) in wanted {
+			match present.get(key) {
+				Err(_) => {
+					$doc = match $doc.insert(["scripts", key], value) {
+						Ok(d) => d
+						Err(_) => return Err(ScriptsNotTable)
+					}
+				}
+				Ok(have) => {
+					if have != value {
+						$kept = $kept.append(key)
+					}
+				}
+			}
+		}
+		Ok({ text: $doc.to_str(), kept: $kept })
 	}
+
+	## The note line (stderr) for a `[scripts]` key that `scripts` kept.
+	kept_note : Str -> Str
+	kept_note = |key| "talon.toml: [scripts] ${key} kept (not the template value)"
 
 	## `existing` with each line of `template` that it does not have, at its end. A blank line and a comment line are added
 	## only when `existing` has no line at all.
@@ -139,8 +177,26 @@ template_name = |text| {
 	}
 }
 
-has_scripts : Str -> Bool
-has_scripts = |text| text.split_on("\n").any(|l| l.trim() == "[scripts]")
+## The `[scripts]` entries of a template, in the order of the lines of its text.
+template_scripts : Str -> Try(List((Str, Value)), [NoScripts, BadTemplate])
+template_scripts = |text| {
+	doc = match Toml.parse(text) {
+		Ok(d) => d
+		Err(_) => return Err(BadTemplate)
+	}
+	table = match doc.get(["scripts"]) {
+		Ok(Table(d)) => d
+		_ => return Err(NoScripts)
+	}
+	lined = table.keys().map(
+		|key| match doc.line(["scripts", key]) {
+			Ok(n) => (n, key)
+			Err(_) => (0, key)
+		},
+	)
+	ordered = lined.sort_with(|a, b| a.0.order_relative_to(b.0))
+	Ok(ordered.keep_oks(|(_, key)| table.get(key).map_ok(|v| (key, v))))
+}
 
 ## The lines from `[scripts]` to the next table (a line that starts with `[` in the first column), or to the end.
 scripts_table : Str -> Try(Str, [NoScripts])

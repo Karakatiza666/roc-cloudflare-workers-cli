@@ -60,3 +60,39 @@ expect {
 	always = Cfw.needs_copy("dev\n", Always)
 	hash_want and js_want and path_want and same and changed and missing and always
 }
+
+# `tln path` (Talon R-PTH1): the alias is the key of the platform entry, the arguments, the one line of stdout.
+expect {
+	named = match Platform.alias(app_with(url)) {
+		Ok(name) => name == "pf"
+		_ => Bool.False
+	}
+	other = match Platform.alias("app [event!] { web: platform \"../p/main.roc\", pf: \"https://example.com/x/1.0.0/H.tar.zst\" }\n") {
+		Ok(name) => name == "web"
+		_ => Bool.False
+	}
+	none = match Platform.alias("app [main!] {}\n") {
+		Err(NoPlatform) => Bool.True
+		_ => Bool.False
+	}
+	args = Platform.tln_args({ alias: "pf", file: "sub/web.roc" }) == ["path", "pf", "--file", "sub/web.roc"]
+	named and other and none and args
+}
+
+# `tln path` output: one absolute line (with or without the line end). Empty, relative and many lines are refused.
+expect {
+	line = Platform.tln_dir("/home/u/.cache/roc/packages/H1\n") == Ok("/home/u/.cache/roc/packages/H1")
+	bare = Platform.tln_dir("/p/H1") == Ok("/p/H1")
+	empty = Platform.tln_dir("") == Err(NoDir)
+	relative = Platform.tln_dir("packages/H1\n") == Err(NoDir)
+	many = Platform.tln_dir("/a\n/b\n") == Err(NoDir)
+	line and bare and empty and relative and many
+}
+
+# The note line of the fallback says why the cache rule was used.
+expect {
+	no_tln = Platform.fallback_note({ alias: "pf", why: NoTln }) == "tln is not on PATH: used the roc cache rule for pf"
+	failed = Platform.fallback_note({ alias: "pf", why: Failed(15) }) == "tln path pf exited with 15: used the roc cache rule"
+	bad = Platform.fallback_note({ alias: "pf", why: BadOutput }).contains("gave no directory")
+	no_tln and failed and bad
+}

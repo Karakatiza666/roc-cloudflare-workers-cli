@@ -59,3 +59,29 @@ expect {
 	}
 	none and unknown and dangling
 }
+
+# R-SYNC-FILE: `sync_args` puts `--file <file>` first when the file is there, and the other arguments follow in order.
+expect {
+	Args.sync_args({ file: "web.roc", file_exists: Bool.True, rest: ["--wasm", "web.wasm", "--check"] }) == ["--file", "web.roc", "--wasm", "web.wasm", "--check"]
+}
+
+# The default file `main.roc` is passed too, when it is there. No other argument: `--file` alone.
+expect {
+	match ok_of(["sync"]) {
+		Ok(p) => Args.sync_args({ file: p.file, file_exists: Bool.True, rest: p.rest }) == ["--file", "main.roc"]
+		Err(_) => Bool.False
+	}
+}
+
+# The file is not there: nothing is added, the other arguments stay as they are.
+expect {
+	Args.sync_args({ file: "main.roc", file_exists: Bool.False, rest: ["--check"] }) == ["--check"]
+}
+
+# `--file X` of the command line goes on as `--file X` once. `--js` never goes on.
+expect {
+	match ok_of(["sync", "--js", "../js", "--file", "sub/web.roc", "--check"]) {
+		Ok(p) => Args.sync_args({ file: p.file, file_exists: Bool.True, rest: p.rest }) == ["--file", "sub/web.roc", "--check"]
+		Err(_) => Bool.False
+	}
+}

@@ -3,12 +3,18 @@
 ## | Command | Flags that the helper reads | Other arguments |
 ## | --- | --- | --- |
 ## | `shim` | `--file <app.roc>`, `--js <dir>` | An error (exit 2) |
-## | `sync` | `--file <app.roc>`, `--js <dir>` | In order, to `node .roc-cfw/cli.mjs sync` |
+## | `sync` | `--file <app.roc>`, `--js <dir>` | In order, to `node .roc-cfw/cli.mjs sync` (see `sync_args`) |
 ## | `init` | `--file <app.roc>`, `--js <dir>`, `--name <name>` | An error (exit 2) |
 ## | `help` (also `--help`, `-h`) | none | none |
 ##
-## A flag has its value in the next argument. The flags `--file` and `--js` are never passed to `cli.mjs`.
+## A flag has its value in the next argument. The flag `--js` is never passed to `cli.mjs`. The flag `--file` is passed by `sync_args`.
 Args :: [].{
+
+	## The arguments after `node .roc-cfw/cli.mjs sync`. `file` is the app file of `roc-cfw` (`--file`, else `main.roc`).
+	## `cli.mjs sync` reads the app source with `--file` to warn of a handler that `Worker.new` does not list.
+	## `--file <file>` goes first, when `file_exists` is true. When the file is not there, nothing is added.
+	sync_args : { file : Str, file_exists : Bool, rest : List(Str) } -> List(Str)
+	sync_args = |args| if args.file_exists ["--file", args.file].concat(args.rest) else args.rest
 
 	## `Err` has the text of the message for the user. The caller exits with code 2.
 	parse : List(Str) -> Try({ cmd : [Help, Shim, Sync, Init], file : Str, js : [Auto, Dir(Str)], name : [Auto, Named(Str)], rest : List(Str) }, Str)
@@ -30,7 +36,8 @@ Args :: [].{
 		\\  roc-cfw shim [--file main.roc] [--js <dir>]
 		\\      Copies js/ of the platform of the app to .roc-cfw/ (when the platform hash changed).
 		\\  roc-cfw sync [--file main.roc] [--js <dir>] [sync arguments]
-		\\      shim, then: node .roc-cfw/cli.mjs sync [sync arguments]. The exit code of node is the exit code.
+		\\      shim, then: node .roc-cfw/cli.mjs sync --file <app file> [sync arguments]. The exit code of node is the exit code.
+		\\      --file is passed on when the app file is there (cli.mjs warns of a handler that Worker.new does not list).
 		\\  roc-cfw init [--file main.roc] [--js <dir>] [--name <name>]
 		\\      Writes the template of the platform: the app body in main.roc, wrangler.toml, [scripts] in talon.toml, .gitignore.
 		\\  --js <dir>: use this directory in place of js/ of the platform (for the repository of the platform).

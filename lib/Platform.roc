@@ -8,6 +8,9 @@ import header.PackageUrl
 ## | A release URL | `$XDG_CACHE_HOME/roc/packages/<hash>/`, else `~/.cache/roc/packages/<hash>/` (Talon R-CR1) | The hash of the URL |
 ## | A path | The directory of the platform file, from the directory of the app file | Nothing |
 ## | Another URL | None (exit 2, as Talon R-PTH3) | |
+##
+## `tln path <alias> --file <app file>` (Talon R-PTH1) gives the directory first. The functions of this module give its
+## arguments, read its output, and say why the cache rule above was used instead.
 Platform :: [].{
 
 	## The platform entry of the header of the app file text.
@@ -63,5 +66,43 @@ Platform :: [].{
 			Url({ hash }) => Hash(hash)
 			Path(_) => Always
 		}
+	}
+
+	## The alias of the platform entry of the header: the key before `platform "..."` (for example `pf`).
+	## The argument of `tln path` (Talon R-PTH1).
+	alias : Str -> Try(Str, [NoHeader, BadHeader, NotApp, NoPlatform])
+	alias = |text| {
+		header = match Header.parse(text) {
+			Ok(h) => h
+			Err(NoHeader) => return Err(NoHeader)
+			Err(BadHeader(_)) => return Err(BadHeader)
+		}
+		match header.kind() {
+			App => {}
+			_ => return Err(NotApp)
+		}
+		match header.entries().find_first(|e| e.is_platform) {
+			Ok(e) => Ok(e.name)
+			Err(_) => Err(NoPlatform)
+		}
+	}
+
+	## The arguments of the `tln` command that gives the directory of an entry (Talon R-PTH1).
+	tln_args : { alias : Str, file : Str } -> List(Str)
+	tln_args = |args| ["path", args.alias, "--file", args.file]
+
+	## The directory from the stdout of `tln path`: one line, an absolute path. `NoDir` for anything else.
+	tln_dir : Str -> Try(Str, [NoDir])
+	tln_dir = |stdout| {
+		line = stdout.trim()
+		if line.starts_with("/") and !line.contains("\n") Ok(line) else Err(NoDir)
+	}
+
+	## The note line (stderr) that says why the cache rule was used and not `tln path`.
+	fallback_note : { alias : Str, why : [NoTln, Failed(I32), BadOutput] } -> Str
+	fallback_note = |args| match args.why {
+		NoTln => "tln is not on PATH: used the roc cache rule for ${args.alias}"
+		Failed(code) => "tln path ${args.alias} exited with ${code.to_str()}: used the roc cache rule"
+		BadOutput => "tln path ${args.alias} gave no directory: used the roc cache rule"
 	}
 }

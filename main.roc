@@ -42,7 +42,7 @@ main! = |os_args| {
 		}
 		Sync => {
 			prepared = prepare!(opts)?
-			run_node!(opts.rest, prepared.js)
+			run_node!(Args.sync_args({ file: opts.file, file_exists: exists!(opts.file), rest: opts.rest }), prepared.js)
 		}
 		Init => init!(opts)
 	}
@@ -89,10 +89,44 @@ env_or_empty! = |name| match Env.var_str!(OsStr.from_str(name)) {
 # ---- The directory of the platform ----
 
 ## The one place that finds the directory of the platform of an app (`pf`).
-## The fallback of TRANSITION 9 row 1: compute `$XDG_CACHE_HOME/roc/packages/<hash>/`, and run `roc check <app>` when it is missing.
-## When `tln path pf` exists (Talon R-PTH1), only the body of this function changes: run `tln path pf` and take its one line.
-platform_dir! : { entry : Entry, file : Str, app_dir : Str } => Try(Str, [Exit(I32)])
-platform_dir! = |args| match args.entry {
+## First `tln path <alias> --file <app file>` (Talon R-PTH1): its one stdout line is the directory. Talon fetches a missing package.
+## When `tln` is not on PATH, or exits non-zero, or gives no directory: the cache rule, with one note line on stderr.
+## The rule: compute `$XDG_CACHE_HOME/roc/packages/<hash>/`, and run `roc check <app>` when it is missing.
+platform_dir! : { entry : Entry, alias : Str, file : Str, app_dir : Str } => Try(Str, [Exit(I32)])
+platform_dir! = |args| match tln_path!({ alias: args.alias, file: args.file }) {
+	Ok(dir) => Ok(dir)
+	Err(why) => {
+		note!(Platform.fallback_note({ alias: args.alias, why }))
+		cache_dir!(args)
+	}
+}
+
+## The directory from `tln path`, or the reason why there is none.
+tln_path! : { alias : Str, file : Str } => Try(Str, [NoTln, Failed(I32), BadOutput])
+tln_path! = |args| {
+	cmd = Cmd.new_str("tln").args_str(Platform.tln_args(args)).stdin(Null).stdout(Capture).stderr(Inherit)
+	out = match cmd.run!() {
+		Ok(o) => o
+		Err(_) => return Err(NoTln)
+	}
+	match out.status {
+		Exited(0) => {}
+		Exited(code) => return Err(Failed(code))
+		Signaled(signal) => return Err(Failed(128 + signal))
+	}
+	text = match Str.from_utf8(out.stdout_bytes) {
+		Ok(t) => t
+		Err(_) => return Err(BadOutput)
+	}
+	match Platform.tln_dir(text) {
+		Ok(dir) if is_dir!(dir) => Ok(dir)
+		_ => Err(BadOutput)
+	}
+}
+
+## The cache rule of TRANSITION 9 row 1.
+cache_dir! : { entry : Entry, alias : Str, file : Str, app_dir : Str } => Try(Str, [Exit(I32)])
+cache_dir! = |args| match args.entry {
 	Path(_) => Ok(Platform.path_dir({ app_dir: args.app_dir, entry: path_value(args.entry) }))
 	Url({ hash }) => {
 		dir = Platform.package_dir({ xdg: env_or_empty!("XDG_CACHE_HOME"), home: env_or_empty!("HOME"), hash })
@@ -141,7 +175,8 @@ locate! = |opts| {
 	js = match opts.js {
 		Dir(dir) => dir
 		Auto => {
-			dir = platform_dir!({ entry, file: opts.file, app_dir })?
+			alias = Platform.alias(text) ?? "pf"
+			dir = platform_dir!({ entry, alias, file: opts.file, app_dir })?
 			"${dir}/js"
 		}
 	}
@@ -199,10 +234,10 @@ install! = |args| {
 
 # ---- sync ----
 
-## `node .roc-cfw/cli.mjs sync [rest]` with the terminal of the process. The exit code of node is the exit code of the helper.
+## `node .roc-cfw/cli.mjs sync [args]` (`Args.sync_args`) with the terminal of the process. The exit code of node is the exit code of the helper.
 run_node! : List(Str), Str => Try({}, [Exit(I32)])
-run_node! = |rest, _js| {
-	cmd = Cmd.new_str("node").args_str([".roc-cfw/cli.mjs", "sync"].concat(rest)).stdin(Inherit).stdout(Inherit).stderr(Inherit)
+run_node! = |args, _js| {
+	cmd = Cmd.new_str("node").args_str([".roc-cfw/cli.mjs", "sync"].concat(args)).stdin(Inherit).stdout(Inherit).stderr(Inherit)
 	match cmd.run!() {
 		Ok(out) => match out.status {
 			Exited(0) => Ok({})
@@ -260,11 +295,14 @@ init! = |opts| {
 		Err(NotStub) => return die!(1, "${opts.file} has an app body already: init replaces only the stub body (crash \"write the app\")")
 		Err(_) => return die!(1, "the header of ${opts.file} or of the template cannot be read")
 	}
-	new_talon = match Scaffold.scripts({ existing: read_or_empty!(talon_path), template: t_talon }) {
-		Ok(t) => t
-		Err(HasScripts) => return die!(1, "${talon_path} has a [scripts] table already: init writes no table over another")
+	merged = match Scaffold.scripts({ existing: read_or_empty!(talon_path), template: t_talon }) {
+		Ok(m) => m
+		Err(BadToml(e)) => return die!(1, "${talon_path} does not parse: line ${e.line.to_str()}, column ${e.column.to_str()}: ${e.message}")
+		Err(ScriptsNotTable) => return die!(1, "${talon_path} has a scripts key that is not a table")
 		Err(NoScripts) => return die!(1, "the template talon.toml has no [scripts] table")
+		Err(BadTemplate) => return die!(1, "the template talon.toml does not parse")
 	}
+	new_talon = merged.text
 	new_ignore = Scaffold.gitignore({ existing: read_or_empty!(ignore_path), template: t_ignore })
 	files = [
 		(wrangler_path, Scaffold.wrangler({ template: t_wrangler, name })),
@@ -277,6 +315,9 @@ init! = |opts| {
 			Ok(_) => {}
 			Err(_) => return die!(1, "cannot write ${path}")
 		}
+	}
+	for key in merged.kept {
+		_ = Stderr.write!("${Scaffold.kept_note(key)}\n")
 	}
 	note!("wrote ${opts.file}, ${wrangler_path} (name ${name}), ${talon_path}, ${ignore_path}")
 	note!("next: tln run build")
