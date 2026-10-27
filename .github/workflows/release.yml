@@ -1,0 +1,102 @@
+# On a tag X.Y.Z (or X.Y.Z-pre): run the tests (ci.yml), make the app bundle (scripts/bundle.sh: `roc bundle` of main.roc and lib/),
+# check it (roc unbundle, roc build), publish the GitHub release with that one asset (Talon R-T10, R-DI4: one <hash>.tar.zst),
+# then build the bundle from the published URL on a clean runner.
+# The release does nothing else: no binary is attached. Talon builds the app from the bundle.
+name: release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      url: ${{ steps.make.outputs.url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || [[ "$TAG" == 0.0.0* ]]; then
+            echo "The tag must be X.Y.Z or X.Y.Z-pre, not 0.0.0: $TAG" >&2
+            exit 1
+          fi
+
+      - name: Install the pinned compiler
+        run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
+
+      - name: Bundle
+        id: make
+        run: |
+          scripts/bundle.sh dist | tee bundle.txt
+          name=$(sed -n 's/^name: //p' bundle.txt)
+          echo "asset=$(sed -n 's/^asset: //p' bundle.txt)" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$name" >> "$GITHUB_OUTPUT"
+
+      - name: Test the bundle
+        run: scripts/test_bundle.sh '${{ steps.make.outputs.asset }}'
+
+      - name: Publish
+        env:
+          TAG: ${{ github.ref_name }}
+          ASSET: ${{ steps.make.outputs.asset }}
+          NAME: ${{ steps.make.outputs.name }}
+          URL: ${{ steps.make.outputs.url }}
+        run: |
+          pre=()
+          [[ "$TAG" == *-* ]] && pre=(--prerelease)
+          sed -e "s|@TAG@|$TAG|g" \
+              -e "s|@URL@|$URL|g" \
+              -e "s|@NAME@|$NAME|g" \
+              -e "s|@NIGHTLY@|$(tr -d '[:space:]' < .roc-version)|g" \
+              .github/release-notes.md > notes.md
+          gh release create "$TAG" "$ASSET" --title "$TAG" --notes-file notes.md --verify-tag "${pre[@]}"
+
+  test-published:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned compiler
+        run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
+
+      - name: Build the published bundle
+        env:
+          URL: ${{ needs.release.outputs.url }}
+        run: |
+          mkdir download
+          curl -fsSL -o "download/$(basename "$URL")" "$URL"
+          scripts/test_bundle.sh "download/$(basename "$URL")"

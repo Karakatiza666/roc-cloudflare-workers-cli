@@ -2,16 +2,14 @@
 # A local end-to-end check of roc-cfw against the real platform JS (no release, no deploy).
 # In a project under .work/platform/: init, build the wasm with the nightly of the platform, sync, sync --check, then (when wrangler
 # is on PATH) `wrangler dev --local` and GET /. It never runs `wrangler deploy`.
-# Usage: scripts/test_platform.sh [<platform repo dir>]    (default: /home/george/dev/Karakatiza666/talon/cloudflare-workers)
-#        ROC=<roc for building roc-cfw>   (default: the pinned nightly of .roc-version, as scripts/test.sh)
+# Usage: scripts/test_platform.sh [<platform repo dir>]    (default: $PLATFORM_REPO, else ../talon/cloudflare-workers)
+#        ROC=<roc for building roc-cfw>   (default: scripts/get-roc.sh: the pinned nightly of .roc-version)
+#        PROC=<roc for the wasm>          (default: .cache/nightlies/<compat/last-stack-first-nightly> of the platform repo, else ROC when the tags are equal)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-REPO=$(cd "${1:-/home/george/dev/Karakatiza666/talon/cloudflare-workers}" && pwd) || exit 1
-PINNED=/home/george/dev/Karakatiza666/talon/cloudflare-workers/.cache/nightlies/$(cat "$ROOT/.roc-version")/roc
-if [ -z "${ROC:-}" ]; then
-  if [ -x "$PINNED" ]; then ROC=$PINNED; else ROC=$(command -v roc); fi
-fi
+REPO=$(cd "${1:-${PLATFORM_REPO:-$ROOT/../talon/cloudflare-workers}}" && pwd) || { echo "no platform repository: give its directory or set PLATFORM_REPO"; exit 1; }
+ROC=${ROC:-$("$HERE/get-roc.sh")} || exit 1
 WORK=$ROOT/.work
 PROJ=$WORK/platform
 FAILS=0
@@ -23,7 +21,10 @@ finish() { echo; if [ $FAILS = 0 ]; then echo "all passed"; exit 0; else echo "$
 command -v node >/dev/null || { echo "node is needed"; exit 1; }
 [ -f "$REPO/platform/main.roc" ] && [ -f "$REPO/js/cfw.json" ] || { echo "no platform/main.roc or js/cfw.json in $REPO"; exit 1; }
 NIGHTLY=$(tr -d '[:space:]' < "$REPO/compat/last-stack-first-nightly")
-PROC=$REPO/.cache/nightlies/$NIGHTLY/roc
+if [ -z "${PROC:-}" ]; then
+  PROC=$REPO/.cache/nightlies/$NIGHTLY/roc
+  [ -x "$PROC" ] || { [ "$NIGHTLY" = "$(tr -d '[:space:]' < "$ROOT/.roc-version")" ] && PROC=$ROC; }
+fi
 [ -x "$PROC" ] || { echo "no roc at $PROC (compat/last-stack-first-nightly)"; exit 1; }
 echo "platform repo: $REPO"
 echo "roc for the wasm: $NIGHTLY"

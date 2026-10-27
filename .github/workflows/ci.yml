@@ -1,0 +1,67 @@
+# The tests of roc-cfw on Linux, macOS and Windows. The compiler is the nightly of .roc-version (scripts/get-roc.sh installs it).
+# Linux and macOS: scripts/test.sh (unit and e2e; e2e needs node and bash). Windows: unit and build only (the e2e runs use fake programs that are bash scripts).
+# On each system: the app bundle (scripts/bundle.sh), unbundled and built (scripts/test_bundle.sh), as release.yml makes it.
+# release.yml runs this file first (workflow_call).
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache of the compiler
+        uses: actions/cache@v4
+        with:
+          path: .cache/nightlies
+          key: roc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.roc-version') }}
+
+      - name: Install the pinned compiler
+        run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
+
+      - name: Require the pinned compiler
+        run: |
+          "$ROC" version
+          "$ROC" version | grep -F "$(sed 's/^nightly-//' .roc-version)"
+
+      - name: Unit tests, build, e2e tests
+        if: runner.os != 'Windows'
+        run: scripts/test.sh
+
+      - name: Unit tests and build
+        if: runner.os == 'Windows'
+        run: |
+          scripts/test.sh unit
+          scripts/test.sh build
+
+      - name: Bundle and test the bundle
+        run: |
+          scripts/bundle.sh dist | tee bundle.txt
+          scripts/test_bundle.sh "$(sed -n 's/^asset: //p' bundle.txt)"

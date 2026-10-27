@@ -3,14 +3,13 @@
 # Step 2: build roc-cfw and run it on the fixtures in fixtures/ (a fake platform package, a stub cli.mjs, a template).
 # The step 2 runs need node. A fake `roc` on PATH stands for the fetch of `roc check`. A fake `tln` on PATH stands for `tln path`
 # (Talon R-PTH1), so the tests do not depend on the Talon cache. Its answer is set by TLN_OUT and TLN_CODE, its calls go to TLN_LOG.
-# Usage: scripts/test.sh [unit|e2e]    ROC=<path of roc> (default: the pinned nightly of the Talon repository, else roc on PATH)
+# Usage: scripts/test.sh [unit|build|e2e]   (build: only roc build and `roc-cfw help`, for a system where the fake programs of e2e cannot run)
+#           ROC=<path of roc> (default: scripts/get-roc.sh, the nightly of .roc-version)
+#        PLATFORM_REPO=<dir> (default: ../talon/cloudflare-workers; the real js/ runs are skipped when it is not there)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-PINNED=/home/george/dev/Karakatiza666/talon/cloudflare-workers/.cache/nightlies/$(cat "$ROOT/.roc-version")/roc
-if [ -z "${ROC:-}" ]; then
-  if [ -x "$PINNED" ]; then ROC=$PINNED; else ROC=$(command -v roc); fi
-fi
+ROC=${ROC:-$("$HERE/get-roc.sh")} || exit 1
 STEP=${1:-all}
 WORK=$ROOT/.work
 FAILS=0
@@ -29,11 +28,21 @@ if [ "$STEP" = all ] || [ "$STEP" = unit ]; then
   done
 fi
 
+# The built file of roc-cfw has the suffix .exe on Windows.
+case $(uname -s) in MINGW* | MSYS* | CYGWIN*) EXE=.exe ;; *) EXE= ;; esac
+
+if [ "$STEP" = build ]; then
+  mkdir -p "$WORK"; cd "$ROOT" || exit 1
+  "$ROC" build --no-cache --output="$WORK/roc-cfw$EXE" main.roc >"$WORK/build.log" 2>&1 || { bad "roc build"; tail -20 "$WORK/build.log"; exit 1; }
+  ok "roc build"
+  if "$WORK/roc-cfw$EXE" help >"$WORK/help.txt" 2>&1 && has "$WORK/help.txt" 'roc-cfw'; then ok "roc-cfw help"; else bad "roc-cfw help"; cat "$WORK/help.txt"; fi
+fi
+
 if [ "$STEP" = all ] || [ "$STEP" = e2e ]; then
   command -v node >/dev/null || { echo "node is needed for the e2e step"; exit 1; }
   rm -rf "$WORK"; mkdir -p "$WORK"
   cd "$ROOT" || exit 1
-  "$ROC" build --no-cache --output="$WORK/roc-cfw" main.roc >"$WORK/build.log" 2>&1 || { bad "roc build"; tail -20 "$WORK/build.log"; exit 1; }
+  "$ROC" build --no-cache --output="$WORK/roc-cfw$EXE" main.roc >"$WORK/build.log" 2>&1 || { bad "roc build"; tail -20 "$WORK/build.log"; exit 1; }
   ok "roc build"
   CFW=$WORK/roc-cfw
   # A cache with the fixture platform under the hash of the fixture app, and one with an api that is not known.
@@ -104,7 +113,7 @@ FAKE
 
   # An api that this version does not know: exit 2, the message, nothing copied.
   project p2; cd "$WORK/p2" || exit 1
-  sed -i 's/FIXTUREHASH/NEWAPI/' main.roc
+  sed 's/FIXTUREHASH/NEWAPI/' main.roc > main.roc.new && mv main.roc.new main.roc
   "$CFW" sync >out 2>err; code=$?
   [ $code = 2 ] && has err 'update roc-cfw: tln update roc-cfw' && [ ! -e .roc-cfw ] && ok "sync: unknown api, exit 2, no copy" || { bad "sync: unknown api (code $code)"; cat err; }
 
@@ -179,7 +188,7 @@ FAKE
   # The real js/ of the platform repository (read only): the copy, then `cli.mjs sync` on a built example. Skipped when the repository is not there.
   # The wasm is the prebuilt hello.wasm of the platform repository (its test-bundle cache), since the build of the platform needs its zig chain.
   # The path platform of examples/hello is not used: --js gives the directory.
-  REAL=${PLATFORM_REPO:-/home/george/dev/Karakatiza666/talon/cloudflare-workers}
+  REAL=${PLATFORM_REPO:-$ROOT/../talon/cloudflare-workers}
   if [ -f "$REAL/js/cfw.json" ] && [ -f "$REAL/examples/hello/main.roc" ]; then
     rm -rf "$WORK/real"; mkdir -p "$WORK/real"; cd "$WORK/real" || exit 1
     cp "$REAL/examples/hello/main.roc" "$REAL/examples/hello/wrangler.toml" .

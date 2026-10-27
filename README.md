@@ -1,8 +1,19 @@
 # roc-cfw
 
-`roc-cfw` is the helper CLI of the Roc platform for Cloudflare Workers (`Karakatiza666/roc-cloudflare-workers`). It is a Roc app on basic-cli. It is step 4 of `talon/cloudflare-workers/research/talon-fit/TRANSITION.md`. This README is the contract. The study is `talon/research/talon-scripts/README.md`, sections 6 and 8.
+`roc-cfw` is the helper CLI of the Roc platform for Cloudflare Workers (`Karakatiza666/roc-cloudflare-workers`). It is a Roc app on basic-cli 0.26.0. It is step 4 of `talon/cloudflare-workers/research/talon-fit/TRANSITION.md`. This README is the contract. The study is `talon/research/talon-scripts/README.md`, sections 6 and 8.
 
 The version-specific JS (the shim, `cli.mjs sync`, the template) is in `js/` of the platform bundle. `roc-cfw` copies it to `.roc-cfw/` and runs it. The header hash of your app pins the JS, so one `roc-cfw` release serves many platform releases.
+
+## Use with Talon
+
+| Step | Command | Result |
+| --- | --- | --- |
+| 1 | `tln init --platform Karakatiza666/roc-cloudflare-workers` | A project with the platform in the header of `main.roc` (a stub body) |
+| 2 | `tln add --tool Karakatiza666/roc-cloudflare-workers-cli --as roc-cfw` | Talon builds `roc-cfw` from the app bundle of the newest release. It writes the `[tools]` entry (`ref` and `url`) in `talon.toml`. |
+| 3 | `tln x roc-cfw -- init` | `init`: the template of the platform (`main.roc`, `wrangler.toml`, `talon.toml`, `.gitignore`) |
+| 4 | `tln run build` | The `build` script of `talon.toml`: `roc build`, then `roc-cfw sync` |
+
+The default key of a tool is the name of the repository (`roc-cloudflare-workers-cli`). The flag `--as roc-cfw` sets the key `roc-cfw`, which the template scripts use. The `url` in `[tools]` pins the release of the helper for the project. `tln update roc-cfw` moves it.
 
 ## Commands
 
@@ -117,11 +128,20 @@ The merge of `talon.toml` takes each key of the `[scripts]` table of the templat
 | e2e | `fixtures/`: a fake platform package (`js/cfw.json`, a stub `cli.mjs`, a template), an app with a release URL, a fake `roc`, a fake `tln` | The built `roc-cfw`: copy, stamp, arguments, exit code, unknown api, `tln path` and the fallbacks, `--file`, `--js`, `init` and the `talon.toml` merge |
 | platform | `scripts/test_platform.sh [<platform repo dir>]` | The real JS of the platform repository, with no release and no deploy (see below) |
 
-Use the pinned compiler: `ROC=<path>` (default: the nightly in `.roc-version`, found in the Talon repository). Build with `roc build --no-cache --output=roc-cfw main.roc`.
+Use the pinned compiler (the nightly in `.roc-version`). `scripts/get-roc.sh` finds it, in this order:
+
+| Order | Source |
+| --- | --- |
+| 1 | `ROC=<path>` in the environment |
+| 2 | `.cache/nightlies/<tag>/roc` (an earlier install) |
+| 3 | `roc` on `PATH`, when `roc version` has the tag |
+| 4 | A download from `roc-lang/nightlies` into `.cache/nightlies/<tag>/` (with `gh`, the sha256 is checked; else with `curl`) |
+
+Build with `roc build --no-cache --output=roc-cfw main.roc`. The e2e layer runs `bash` and `node`. The step `scripts/test.sh build` only builds and runs `roc-cfw help`.
 
 ### test_platform.sh
 
-`scripts/test_platform.sh [<platform repo dir>]` (default: the Talon `cloudflare-workers` repository) makes a project in `.work/platform/` and checks the platform JS on disk:
+`scripts/test_platform.sh [<platform repo dir>]` (default: `$PLATFORM_REPO`, else `../talon/cloudflare-workers`) makes a project in `.work/platform/` and checks the platform JS on disk:
 
 | Step | Check |
 | --- | --- |
@@ -137,11 +157,44 @@ Use the pinned compiler: `ROC=<path>` (default: the nightly in `.roc-version`, f
 | --- | --- |
 | `main.roc` | The app: the effects (files, `node`, `roc check`) and the order of the steps |
 | `lib/` | The pure decisions: `Args`, `Cfw`, `Platform`, `Scaffold`. They use `roc-app-header` 0.1.0 and `roc-toml` 0.1.0 by release URL. |
-| `scripts/` | `test.sh` (unit and e2e), `test_platform.sh` (the real platform JS) |
+| `scripts/` | `test.sh` (unit, build and e2e), `test_platform.sh` (the real platform JS), `get-roc.sh` (the pinned compiler), `bundle.sh` (the app bundle), `test_bundle.sh` (unbundle, build and run the bundle) |
+| `.github/workflows/` | `ci.yml` (tests), `release.yml` (the release on a tag) |
+| `.github/release-notes.md` | The text of the notes of a release |
+
+## CI
+
+`.github/workflows/ci.yml` runs on each push and pull request. The compiler is the nightly of `.roc-version`.
+
+| System | Steps |
+| --- | --- |
+| Linux, macOS | `scripts/test.sh` (unit and e2e), then the bundle check |
+| Windows | `scripts/test.sh unit`, `scripts/test.sh build`, then the bundle check. The e2e layer does not run: its fake `roc` and `tln` are bash scripts. |
+
+The bundle check is `scripts/bundle.sh` and `scripts/test_bundle.sh`. Basic-cli 0.26.0 makes the Windows link possible (the Windows C runtime inputs).
 
 ## Release
 
-An app bundle (`roc bundle`), so that Talon builds it from the locked `url` of `[tools]`. Not done here.
+A release is an app bundle (`roc bundle`). Talon builds it from the locked `url` of `[tools]` (Talon R-T10, R-PT6). The header of `main.roc` has the pin `roc: "<nightly>"`, which Talon needs (R-T29). It must equal `.roc-version`: `scripts/bundle.sh` checks this.
+
+| Step | Who | Action |
+| --- | --- | --- |
+| 1 | You | Make sure that CI is green on `main`. |
+| 2 | You | `git tag X.Y.Z && git push origin X.Y.Z` (the tag is `X.Y.Z` with no `v`; `X.Y.Z-pre` makes a prerelease; not `0.0.0`) |
+| 3 | `release.yml` | Run `ci.yml` (all tests on 3 systems). |
+| 4 | `release.yml` | `scripts/bundle.sh`: `roc bundle main.roc lib/*.roc` gives `<hash>.tar.zst`. `scripts/test_bundle.sh` unbundles it and builds it. |
+| 5 | `release.yml` | `gh release create` with that one asset and the notes of `.github/release-notes.md`. |
+| 6 | `release.yml` | `test-published`: download the bundle from the release URL, unbundle, build. |
+
+The release has exactly one `<hash>.tar.zst` asset (Talon R-DI4). Do not add another asset by hand.
+
+Check a bundle on your machine:
+
+```text
+scripts/bundle.sh dist                 # prints asset: and name:
+scripts/test_bundle.sh dist/<hash>.tar.zst
+```
+
+A change of the `api` of the platform contract needs a new release (see "The contract with the platform bundle").
 
 ## License
 

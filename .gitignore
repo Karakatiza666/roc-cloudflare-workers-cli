@@ -2,3 +2,5 @@
 /.work/
 /.roc-cfw/
 *.wasm
+/.cache/
+/dist/

@@ -1,6 +1,7 @@
 app [main!] {
 	lib: "lib/main.roc",
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
+	roc: "nightly-2026-10-14-38a3029",
 }
 
 import pf.Cmd
@@ -80,6 +81,10 @@ exists! = |path| match Path.exists!(Path.utf8(path)) {
 	Err(_) => Bool.False
 }
 
+## A command of basic-cli from the program and the arguments, as text.
+command : Str, List(Str) -> Cmd.Command
+command = |program, args| Cmd.new(OsStr.from_str(program)).args(args.map(OsStr.from_str))
+
 env_or_empty! : Str => Str
 env_or_empty! = |name| match Env.var_str!(OsStr.from_str(name)) {
 	Ok(value) => value
@@ -104,7 +109,7 @@ platform_dir! = |args| match tln_path!({ alias: args.alias, file: args.file }) {
 ## The directory from `tln path`, or the reason why there is none.
 tln_path! : { alias : Str, file : Str } => Try(Str, [NoTln, Failed(I32), BadOutput])
 tln_path! = |args| {
-	cmd = Cmd.new_str("tln").args_str(Platform.tln_args(args)).stdin(Null).stdout(Capture).stderr(Inherit)
+	cmd = command("tln", Platform.tln_args(args)).stdin(Null).stdout(Capture).stderr(Inherit)
 	out = match cmd.run!() {
 		Ok(o) => o
 		Err(_) => return Err(NoTln)
@@ -134,7 +139,7 @@ cache_dir! = |args| match args.entry {
 			Ok(dir)
 		} else {
 			note!("the platform is not in the cache: roc check ${args.file}")
-			_ = Cmd.new_str("roc").args_str(["check", args.file]).stdin(Null).stdout(Inherit).stderr(Inherit).run!()
+			_ = command("roc", ["check", args.file]).stdin(Null).stdout(Inherit).stderr(Inherit).run!()
 			if is_dir!(dir) Ok(dir) else die!(1, "the platform ${hash} is not in ${dir}, also after roc check ${args.file}")
 		}
 	}
@@ -237,7 +242,7 @@ install! = |args| {
 ## `node .roc-cfw/cli.mjs sync [args]` (`Args.sync_args`) with the terminal of the process. The exit code of node is the exit code of the helper.
 run_node! : List(Str), Str => Try({}, [Exit(I32)])
 run_node! = |args, _js| {
-	cmd = Cmd.new_str("node").args_str([".roc-cfw/cli.mjs", "sync"].concat(args)).stdin(Inherit).stdout(Inherit).stderr(Inherit)
+	cmd = command("node", [".roc-cfw/cli.mjs", "sync"].concat(args)).stdin(Inherit).stdout(Inherit).stderr(Inherit)
 	match cmd.run!() {
 		Ok(out) => match out.status {
 			Exited(0) => Ok({})
