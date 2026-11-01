@@ -1,8 +1,10 @@
-# On a tag X.Y.Z (or X.Y.Z-pre): run the tests (ci.yml), make the app bundle (scripts/bundle.sh: `roc bundle` of main.roc and lib/),
-# check it (roc unbundle, roc build), publish the GitHub release with the bundle (Talon R-T10, R-DI4: one <hash>.tar.zst),
-# then build the bundle from the published URL on a clean runner.
-# Then build roc-cfw for 5 targets (job binaries), and attach the binaries, SHA256SUMS and a build attestation to the same release (job attach).
-# The bundle is the main asset and is published first. A failed binary build does not undo it: the jobs binaries and attach come after the release.
+# On a tag X.Y.Z (or X.Y.Z-pre) only. The run is the one run that Talon checks (R-PT17 to R-PT24): its source ref is refs/tags/<tag>,
+# and the bundle and the binaries are attested in it, on GitHub-hosted runners. There is no workflow_dispatch: a run on a branch
+# would give the source ref refs/heads/<branch>, and Talon would reject it.
+# Flow: tests (ci.yml) -> bundle (scripts/bundle.sh, checked with scripts/test_bundle.sh) -> binaries (5 targets, in parallel)
+#       -> publish (SHA256SUMS, attestation of the bundle and the binaries, ONE `gh release create` with all assets) -> test-published.
+# A binary asset is <hash>-<target> (<hash>-x64win.exe on Windows): <hash> is the name of the bundle without .tar.zst (Talon R-PT17).
+# A failed binary target does not block the bundle: publish runs with the targets that were built.
 name: release
 
 on:
@@ -12,10 +14,6 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+-*'
 
 permissions: {}
-
-# The prefix of the binary assets: <prefix>-<target>[.exe]. Change it here only.
-env:
-  ASSET_PREFIX: roc-cfw
 
 concurrency:
   group: release
@@ -27,15 +25,17 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci.yml
 
-  release:
+  bundle:
     needs: tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
+      name: ${{ steps.make.outputs.name }}
+      hash: ${{ steps.make.outputs.hash }}
       url: ${{ steps.make.outputs.url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -59,56 +59,22 @@ jobs:
         run: |
           scripts/bundle.sh dist | tee bundle.txt
           name=$(sed -n 's/^name: //p' bundle.txt)
-          echo "asset=$(sed -n 's/^asset: //p' bundle.txt)" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "hash=${name%.tar.zst}" >> "$GITHUB_OUTPUT"
           echo "url=https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$name" >> "$GITHUB_OUTPUT"
 
       - name: Test the bundle
-        run: scripts/test_bundle.sh '${{ steps.make.outputs.asset }}'
+        run: scripts/test_bundle.sh "dist/${{ steps.make.outputs.name }}"
 
-      - name: Publish
-        env:
-          TAG: ${{ github.ref_name }}
-          ASSET: ${{ steps.make.outputs.asset }}
-          NAME: ${{ steps.make.outputs.name }}
-          URL: ${{ steps.make.outputs.url }}
-        run: |
-          pre=()
-          [[ "$TAG" == *-* ]] && pre=(--prerelease)
-          sed -e "s|@TAG@|$TAG|g" \
-              -e "s|@URL@|$URL|g" \
-              -e "s|@NAME@|$NAME|g" \
-              -e "s|@NIGHTLY@|$(tr -d '[:space:]' < .roc-version)|g" \
-              .github/release-notes.md > notes.md
-          gh release create "$TAG" "$ASSET" --title "$TAG" --notes-file notes.md --verify-tag "${pre[@]}"
-
-  test-published:
-    needs: release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/upload-artifact@v4
         with:
-          persist-credentials: false
+          name: bundle
+          path: dist/${{ steps.make.outputs.name }}
+          if-no-files-found: error
 
-      - name: Install the pinned compiler
-        run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
-
-      - name: Build the published bundle
-        env:
-          URL: ${{ needs.release.outputs.url }}
-        run: |
-          mkdir download
-          curl -fsSL -o "download/$(basename "$URL")" "$URL"
-          scripts/test_bundle.sh "download/$(basename "$URL")"
-
-  # The binaries use the same targets and names as the release of Talon. A failed target does not stop the other targets.
+  # The names and targets are those of the release of Talon. A failed target does not stop the other targets.
   binaries:
-    needs: release
+    needs: bundle
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -127,6 +93,8 @@ jobs:
         shell: bash
     env:
       GH_TOKEN: ${{ github.token }}
+      # The asset name: <hash>-<target>[.exe]. Change the form here only.
+      ASSET: ${{ needs.bundle.outputs.hash }}-${{ matrix.target }}${{ matrix.ext }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -135,27 +103,24 @@ jobs:
       - name: Install the pinned compiler
         run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
 
-      - name: Name of the asset
-        run: echo "ASSET=$ASSET_PREFIX-${{ matrix.target }}${{ matrix.ext }}" >> "$GITHUB_ENV"
-
       - name: Build
         run: '"$ROC" build --no-cache --opt=speed --target=${{ matrix.target }} --output="$ASSET" main.roc'
 
-      # Only a binary that runs on this runner can run here. The other targets are checked by file size only.
+      # Only a binary that can run on its runner is run. The other targets are not run.
       - name: Run the binary
         if: (matrix.os == 'ubuntu-24.04' && matrix.target == 'x64musl') || (matrix.os == 'macos-latest' && matrix.target == 'arm64mac') || matrix.target == 'x64win'
-        run: ./$ASSET help | grep -q '^usage:'
+        run: ./"$ASSET" help | grep -q '^usage:'
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: bin-${{ matrix.target }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
-  # Attach the binaries that were built. This job runs when some targets failed. It does nothing when no target was built.
-  attach:
-    needs: [release, binaries]
-    if: ${{ !cancelled() && needs.release.result == 'success' }}
+  # One release with all assets. It runs when some targets failed, and then the release has only the targets that were built.
+  publish:
+    needs: [bundle, binaries]
+    if: ${{ !cancelled() && needs.bundle.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -164,29 +129,70 @@ jobs:
       attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      NAME: ${{ needs.bundle.outputs.name }}
+      URL: ${{ needs.bundle.outputs.url }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # For people. Talon reads no checksum file (R-PT17): it compares the sha256 with the digest of the GitHub asset.
       - name: Checksums
         run: |
-          shopt -s nullglob
           cd dist
-          files=("$ASSET_PREFIX"-*)
-          if [ ${#files[@]} -eq 0 ]; then echo "::warning::No binary was built: the release has the bundle only."; exit 0; fi
-          sha256sum "${files[@]}" > SHA256SUMS
+          ls -l
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
+      # The bundle and each binary are subjects of the attestation, made in this run at the tag commit (Talon R-PT20).
       - name: Attest
-        if: hashFiles('dist/SHA256SUMS') != ''
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/${{ env.ASSET_PREFIX }}-*
+          subject-path: |
+            dist/*.tar.zst
+            dist/*-x64musl
+            dist/*-arm64musl
+            dist/*-x64mac
+            dist/*-arm64mac
+            dist/*-x64win.exe
 
-      - name: Attach to the release
-        if: hashFiles('dist/SHA256SUMS') != ''
+      - name: Publish
+        run: |
+          pre=()
+          [[ "$TAG" == *-* ]] && pre=(--prerelease)
+          sed -e "s|@TAG@|$TAG|g" \
+              -e "s|@URL@|$URL|g" \
+              -e "s|@NAME@|$NAME|g" \
+              -e "s|@NIGHTLY@|$(tr -d '[:space:]' < .roc-version)|g" \
+              .github/release-notes.md > notes.md
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag "${pre[@]}"
+
+  test-published:
+    needs: [bundle, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned compiler
+        run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
+
+      - name: Build the published bundle
         env:
-          TAG: ${{ github.ref_name }}
-        run: gh release upload "$TAG" dist/"$ASSET_PREFIX"-* dist/SHA256SUMS -R "$GITHUB_REPOSITORY"
+          URL: ${{ needs.bundle.outputs.url }}
+        run: |
+          mkdir download
+          curl -fsSL -o "download/$(basename "$URL")" "$URL"
+          scripts/test_bundle.sh "download/$(basename "$URL")"

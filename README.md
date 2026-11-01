@@ -182,9 +182,8 @@ A release is an app bundle (`roc bundle`). Talon builds it from the locked `url`
 | 2 | You | `git tag X.Y.Z && git push origin X.Y.Z` (the tag is `X.Y.Z` with no `v`; `X.Y.Z-pre` makes a prerelease; not `0.0.0`) |
 | 3 | `release.yml` | Run `ci.yml` (all tests on 3 systems). |
 | 4 | `release.yml` | `scripts/bundle.sh`: `roc bundle main.roc lib/*.roc` gives `<hash>.tar.zst`. `scripts/test_bundle.sh` unbundles it and builds it. |
-| 5 | `release.yml` | `gh release create` with that one asset and the notes of `.github/release-notes.md`. |
+| 5 | `release.yml` | `binaries`: build `roc-cfw` for 5 targets. `publish`: make `SHA256SUMS`, attest the bundle and the binaries, then `gh release create` with all assets and the notes of `.github/release-notes.md`. |
 | 6 | `release.yml` | `test-published`: download the bundle from the release URL, unbundle, build. |
-| 7 | `release.yml` | `binaries`: build `roc-cfw` for 5 targets. `attach`: make `SHA256SUMS`, attest the binaries, add all to the release. |
 
 The release has exactly one `<hash>.tar.zst` asset (Talon R-DI4). Do not add another `.tar.zst` asset by hand. The binaries (next section) are other asset types.
 
@@ -199,25 +198,28 @@ A change of the `api` of the platform contract needs a new release (see "The con
 
 ## Prebuilt binaries
 
-The bundle stays the main asset. After it, the release gets a binary for each target, so a cold run does not need a second Roc compiler. Each binary is built with `roc build --opt=speed --target=<target>` and the pinned nightly.
+The bundle stays the main asset. The release also has a binary for each target, so a cold run does not need a second Roc compiler. Each binary is built with `roc build --opt=speed --target=<target>` and the pinned nightly. The names follow Talon (DESIGN-CLI R-PT17): `<hash>` is the name of the bundle without `.tar.zst`.
 
 | Asset | System |
 | --- | --- |
-| `roc-cfw-x64musl` | Linux x64 (static) |
-| `roc-cfw-arm64musl` | Linux arm64 (static) |
-| `roc-cfw-x64mac` | macOS x64 |
-| `roc-cfw-arm64mac` | macOS arm64 |
-| `roc-cfw-x64win.exe` | Windows x64 |
-| `SHA256SUMS` | The SHA-256 of each binary of the release |
+| `<hash>.tar.zst` | The app bundle (the main asset) |
+| `<hash>-x64musl` | Linux x64 (static) |
+| `<hash>-arm64musl` | Linux arm64 (static) |
+| `<hash>-x64mac` | macOS x64 |
+| `<hash>-arm64mac` | macOS arm64 |
+| `<hash>-x64win.exe` | Windows x64 |
+| `SHA256SUMS` | The SHA-256 of each asset, for people (Talon does not read it) |
 
-The names are the target names of Talon. The binary build is a separate job after the release. If a target fails, the bundle release stays and the other binaries are still attached. A release can lack a binary, so a user must not assume that every target is there.
+The workflow makes the bundle and all binaries first, then makes the release with all assets in one step. If a target fails, the bundle release stays and the other binaries are still attached. A release can lack a binary, so a user must not assume that every target is there. The name prefix of the assets comes from the bundle name, and the form of the name is the `ASSET` variable of the job `binaries` in `release.yml`.
 
-Each binary has a GitHub artifact attestation (`actions/attest-build-provenance`). Verify a binary:
+The bundle and each binary have a GitHub artifact attestation (`actions/attest-build-provenance`) from one run of `release.yml`. The run starts only on a tag push, so the source ref is `refs/tags/<tag>`. The runners are GitHub-hosted. Verify a file:
 
 ```text
-gh attestation verify roc-cfw-x64musl -R Karakatiza666/roc-cloudflare-workers-cli
+gh attestation verify <hash>-x64musl --repo Karakatiza666/roc-cloudflare-workers-cli --source-ref refs/tags/<tag> --deny-self-hosted-runners
 sha256sum -c --ignore-missing SHA256SUMS
 ```
+
+Run the first command on the bundle too. A binary is good when its attestation and the one of the bundle have the same commit and the same workflow file. The attestation does not prove that the binary was compiled from the bytes of the bundle.
 
 Talon support (download the binary when the release has one for the target, build from the bundle if not) is coming. Until then, `tln add --tool` builds from the bundle.
 

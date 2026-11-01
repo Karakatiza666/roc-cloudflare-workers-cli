@@ -1,6 +1,6 @@
 # roc-cfw @TAG@
 
-`roc-cfw` is the helper CLI of the Roc platform for Cloudflare Workers (`Karakatiza666/roc-cloudflare-workers`). The main asset is the app bundle `@NAME@`. Talon builds it for your system. A later step of the release can attach prebuilt binaries `roc-cfw-<target>`, `SHA256SUMS` and a build attestation (see the README).
+`roc-cfw` is the helper CLI of the Roc platform for Cloudflare Workers (`Karakatiza666/roc-cloudflare-workers`). The main asset is the app bundle `@NAME@`. Talon builds it for your system. The release can also have prebuilt binaries `<hash>-<target>` (`<hash>` is `@NAME@` without `.tar.zst`), `SHA256SUMS`, and a build attestation of the bundle and the binaries (see the README).
 
 ## Use with Talon
 
