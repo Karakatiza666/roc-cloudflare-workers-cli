@@ -1,7 +1,8 @@
 # On a tag X.Y.Z (or X.Y.Z-pre): run the tests (ci.yml), make the app bundle (scripts/bundle.sh: `roc bundle` of main.roc and lib/),
-# check it (roc unbundle, roc build), publish the GitHub release with that one asset (Talon R-T10, R-DI4: one <hash>.tar.zst),
+# check it (roc unbundle, roc build), publish the GitHub release with the bundle (Talon R-T10, R-DI4: one <hash>.tar.zst),
 # then build the bundle from the published URL on a clean runner.
-# The release does nothing else: no binary is attached. Talon builds the app from the bundle.
+# Then build roc-cfw for 5 targets (job binaries), and attach the binaries, SHA256SUMS and a build attestation to the same release (job attach).
+# The bundle is the main asset and is published first. A failed binary build does not undo it: the jobs binaries and attach come after the release.
 name: release
 
 on:
@@ -100,3 +101,85 @@ jobs:
           mkdir download
           curl -fsSL -o "download/$(basename "$URL")" "$URL"
           scripts/test_bundle.sh "download/$(basename "$URL")"
+
+  # The binaries use the same targets and names as the release of Talon. A failed target does not stop the other targets.
+  binaries:
+    needs: release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x64musl, asset: roc-cfw-x64musl }
+          - { os: ubuntu-24.04, target: arm64musl, asset: roc-cfw-arm64musl }
+          - { os: macos-latest, target: x64mac, asset: roc-cfw-x64mac }
+          - { os: macos-latest, target: arm64mac, asset: roc-cfw-arm64mac }
+          - { os: windows-latest, target: x64win, asset: roc-cfw-x64win.exe }
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned compiler
+        run: echo "ROC=$(scripts/get-roc.sh)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: '"$ROC" build --no-cache --opt=speed --target=${{ matrix.target }} --output=${{ matrix.asset }} main.roc'
+
+      # Only a binary that runs on this runner can run here. The other targets are checked by file size only.
+      - name: Run the binary
+        if: (matrix.os == 'ubuntu-24.04' && matrix.target == 'x64musl') || (matrix.os == 'macos-latest' && matrix.target == 'arm64mac') || matrix.target == 'x64win'
+        run: ./${{ matrix.asset }} help | grep -q '^usage:'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  # Attach the binaries that were built. This job runs when some targets failed. It does nothing when no target was built.
+  attach:
+    needs: [release, binaries]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          shopt -s nullglob
+          cd dist
+          files=(roc-cfw-*)
+          if [ ${#files[@]} -eq 0 ]; then echo "::warning::No binary was built: the release has the bundle only."; exit 0; fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest
+        if: hashFiles('dist/SHA256SUMS') != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/roc-cfw-*
+
+      - name: Attach to the release
+        if: hashFiles('dist/SHA256SUMS') != ''
+        env:
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" dist/roc-cfw-* dist/SHA256SUMS -R "$GITHUB_REPOSITORY"

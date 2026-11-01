@@ -184,8 +184,9 @@ A release is an app bundle (`roc bundle`). Talon builds it from the locked `url`
 | 4 | `release.yml` | `scripts/bundle.sh`: `roc bundle main.roc lib/*.roc` gives `<hash>.tar.zst`. `scripts/test_bundle.sh` unbundles it and builds it. |
 | 5 | `release.yml` | `gh release create` with that one asset and the notes of `.github/release-notes.md`. |
 | 6 | `release.yml` | `test-published`: download the bundle from the release URL, unbundle, build. |
+| 7 | `release.yml` | `binaries`: build `roc-cfw` for 5 targets. `attach`: make `SHA256SUMS`, attest the binaries, add all to the release. |
 
-The release has exactly one `<hash>.tar.zst` asset (Talon R-DI4). Do not add another asset by hand.
+The release has exactly one `<hash>.tar.zst` asset (Talon R-DI4). Do not add another `.tar.zst` asset by hand. The binaries (next section) are other asset types.
 
 Check a bundle on your machine:
 
@@ -195,6 +196,30 @@ scripts/test_bundle.sh dist/<hash>.tar.zst
 ```
 
 A change of the `api` of the platform contract needs a new release (see "The contract with the platform bundle").
+
+## Prebuilt binaries
+
+The bundle stays the main asset. After it, the release gets a binary for each target, so a cold run does not need a second Roc compiler. Each binary is built with `roc build --opt=speed --target=<target>` and the pinned nightly.
+
+| Asset | System |
+| --- | --- |
+| `roc-cfw-x64musl` | Linux x64 (static) |
+| `roc-cfw-arm64musl` | Linux arm64 (static) |
+| `roc-cfw-x64mac` | macOS x64 |
+| `roc-cfw-arm64mac` | macOS arm64 |
+| `roc-cfw-x64win.exe` | Windows x64 |
+| `SHA256SUMS` | The SHA-256 of each binary of the release |
+
+The names are the target names of Talon. The binary build is a separate job after the release. If a target fails, the bundle release stays and the other binaries are still attached. A release can lack a binary, so a user must not assume that every target is there.
+
+Each binary has a GitHub artifact attestation (`actions/attest-build-provenance`). Verify a binary:
+
+```text
+gh attestation verify roc-cfw-x64musl -R Karakatiza666/roc-cloudflare-workers-cli
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Talon support (download the binary when the release has one for the target, build from the bundle if not) is coming. Until then, `tln add --tool` builds from the bundle.
 
 ## License
 
