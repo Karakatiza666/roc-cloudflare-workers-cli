@@ -219,9 +219,9 @@ gh attestation verify <hash>-x64musl --repo Karakatiza666/roc-cloudflare-workers
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
-Run the first command on the bundle too. A binary is good when its attestation and the one of the bundle have the same commit and the same workflow file. The attestation does not prove that the binary was compiled from the bytes of the bundle.
+The command needs `gh` 2.68.0 or later (`--source-ref` came in 2.68.0; `gh attestation` alone came in 2.49.0, and Ubuntu's packaged `gh` 2.46.0 has neither). Run the first command on the bundle too. A binary is good when its attestation and the one of the bundle have the same commit and the same workflow file. The attestation does not prove that the binary was compiled from the bytes of the bundle.
 
-Talon support (download the binary when the release has one for the target, build from the bundle if not) is coming. Until then, `tln add --tool` builds from the bundle.
+Talon support (download the binary when the release has one for the target, build from the bundle if not) is coming. Prebuilt binaries need `gh` 2.68.0 or later: with no `gh`, an older `gh`, or no valid attestation, Talon builds from the bundle. To build from the bundle always, set `tool-binaries = false` in the Talon `config.toml`, or `bin = false` on the `[tools]` entry. Until Talon has this support, `tln add --tool` builds from the bundle.
 
 ## License
 
