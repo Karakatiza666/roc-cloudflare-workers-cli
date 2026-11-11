@@ -3,6 +3,7 @@
 # Step 2: build roc-cfw and run it on the fixtures in fixtures/ (a fake platform package, a stub cli.mjs, a template).
 # The step 2 runs need node. A fake `roc` on PATH stands for the fetch of `roc check`. A fake `tln` on PATH stands for `tln path`
 # (Talon R-PTH1), so the tests do not depend on the Talon cache. Its answer is set by TLN_OUT and TLN_CODE, its calls go to TLN_LOG.
+# deploy: a fake wrangler (fixtures/deploy/wrangler) and a fake Worker (fixtures/deploy/server.mjs on 127.0.0.1). No call reaches Cloudflare.
 # Usage: scripts/test.sh [unit|build|e2e]   (build: only roc build and `roc-cfw help`, for a system where the fake programs of e2e cannot run)
 #           ROC=<path of roc> (default: scripts/get-roc.sh, the nightly of .roc-version)
 #        PLATFORM_REPO=<dir> (default: ../talon/cloudflare-workers; the real js/ runs are skipped when it is not there)
@@ -184,6 +185,131 @@ FAKE
   [ $code = 1 ] && has err 'not a table' && [ ! -e wrangler.toml ] && diff -r -x out -x err . "$WORK/p13.before" >/dev/null && ok "init: scripts is not a table, exit 1, nothing written" || { bad "init: scripts = 1 (code $code)"; cat err; }
   "$CFW" bogus >out 2>err; code=$?
   [ $code = 2 ] && ok "bad command, exit 2" || bad "bad command (code $code)"
+
+  # deploy (docs/deploy.md): a fake wrangler on PATH (fixtures/deploy/wrangler, it never reaches Cloudflare) and a fake Worker
+  # (fixtures/deploy/server.mjs on 127.0.0.1) for the smoke checks. The fake wrangler logs each call to WR_LOG.
+  mkdir -p "$WORK/wrbin" "$WORK/wrstate"; cp "$ROOT/fixtures/deploy/wrangler" "$WORK/wrbin/wrangler"
+  export WR_STATE=$WORK/wrstate WR_LOG=$WORK/wrangler.log
+  node "$ROOT/fixtures/deploy/server.mjs" "$WR_STATE" & SERVER=$!
+  trap 'kill $SERVER 2>/dev/null' EXIT
+  for _ in $(seq 50); do [ -s "$WR_STATE/port" ] && break; sleep 0.1; done
+  BASE="http://127.0.0.1:$(cat "$WR_STATE/port")"
+  # dproject <name>: a project with a built app.wasm (newer than main.roc), the live version "old", a clean log.
+  dproject() {
+    project "$1"; cd "$WORK/$1" || exit 1
+    touch -d 2026-01-01T00:00:00 main.roc; printf '\0asm' > app.wasm
+    echo old > "$WR_STATE/live"; echo '{}' > "$WR_STATE/new.json"; rm -f "$WR_LOG"; touch "$WR_LOG"
+  }
+  DPATH="$WORK/wrbin:$PATH"
+  # The number of lines of a file (macOS wc pads it with spaces).
+  lines() { wc -l < "$1" | tr -d ' '; }
+
+  # Success: preflight (sync --check with --file, --wasm), status, upload with the default message, deploy at 100%, smoke ok.
+  dproject d1
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke /health --smoke-same /data --wait 0 >out 2>err; code=$?
+  [ $code = 0 ] && has out 'STUB args=\["sync","--file","main.roc","--wasm","app.wasm","--check"\]' \
+    && [ "$(sed -n 1p "$WR_LOG")" = "deployments status --json" ] \
+    && sed -n 2p "$WR_LOG" | grep -q '^versions upload --message roc-cfw 0\.0\.2' \
+    && sed -n 3p "$WR_LOG" | grep -q '^versions deploy v-new@100% --message roc-cfw 0\.0\.2 .* --yes$' \
+    && [ "$(lines "$WR_LOG")" = 3 ] && has out '^smoke ok   GET /health' && has out '^smoke ok   GET /data' && has out '^deploy: done' \
+    && has err "rollback command: wrangler rollback v-old --message 'roc-cfw rollback' --yes" && [ "$(cat "$WR_STATE/live")" = new ] \
+    && ok "deploy: success, 3 wrangler calls, smoke ok, rollback command printed" || { bad "deploy: success (code $code)"; cat out err "$WR_LOG"; }
+
+  # Preflight failures: no wrangler call. sync --check fails (its exit code passes through), a stale wasm, no wasm.
+  dproject d2
+  STUB_EXIT=1 PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ ! -s "$WR_LOG" ] && has err 'preflight failed (sync --check exit 1). Nothing changed.' && ok "deploy: sync --check fails, exit 1, no wrangler call" || { bad "deploy: sync --check fails (code $code)"; cat err "$WR_LOG"; }
+  STUB_EXIT=2 PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 2 ] && [ ! -s "$WR_LOG" ] && ok "deploy: sync --check exit 2 passes through" || bad "deploy: sync --check exit 2 (code $code)"
+  mkdir -p lib; touch lib/Extra.roc
+  PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ ! -s "$WR_LOG" ] && has err 'app.wasm is older than ./lib/Extra.roc' && ! has out STUB && ok "deploy: stale wasm, exit 1, no sync, no wrangler call" || { bad "deploy: stale wasm (code $code)"; cat err; }
+  PATH=$DPATH "$CFW" deploy --wasm app.wasm --dry-run >out 2>err; code=$?
+  [ $code = 0 ] && has err 'was given with --wasm' && ok "deploy: --wasm skips the age check" || { bad "deploy: --wasm (code $code)"; cat err; }
+  rm -f app.wasm "$WR_LOG"; touch "$WR_LOG"
+  PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ ! -s "$WR_LOG" ] && has err 'app.wasm is not there' && ok "deploy: no wasm, exit 1, no wrangler call" || { bad "deploy: no wasm (code $code)"; cat err; }
+
+  # Migrations from roc-cfw.toml: the pending list, then apply, before the upload. The file also gives the url and a check.
+  dproject d3
+  printf '[deploy]\nurl = "%s"\nmigrate = ["DB"]\nwait = 0\n\n[[deploy.smoke]]\npath = "/health"\n' "$BASE" > roc-cfw.toml
+  PATH=$DPATH "$CFW" deploy --message m3 >out 2>err; code=$?
+  [ $code = 0 ] && [ "$(cat "$WR_LOG")" = "$(printf 'deployments status --json\nd1 migrations list DB --remote\nd1 migrations apply DB --remote\nversions upload --message m3\nversions deploy v-new@100%% --message m3 --yes')" ] \
+    && has out '0002_add_index.sql' && has out '^smoke ok   GET /health' && ok "deploy: migrations listed, then applied, before the upload (roc-cfw.toml)" || { bad "deploy: migrations (code $code)"; cat out err "$WR_LOG"; }
+
+  # A smoke check fails: automatic rollback to the recorded version, exit 3.
+  dproject d4
+  echo '{"health": 500}' > "$WR_STATE/new.json"
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke /health --wait 0 --message m4 >out 2>err; code=$?
+  [ $code = 3 ] && [ "$(tail -1 "$WR_LOG")" = "rollback v-old --message roc-cfw: smoke check failed --yes" ] && [ "$(lines "$WR_LOG")" = 4 ] \
+    && has out 'smoke FAIL GET /health: status 500, expected 200' && has out 'rolled back to v-old' && [ "$(cat "$WR_STATE/live")" = old ] \
+    && ok "deploy: smoke fails, rollback to the old version, exit 3" || { bad "deploy: smoke fails, rollback (code $code)"; cat out err "$WR_LOG"; }
+
+  # The same, with --no-rollback: no rollback call, exit 4, the rollback command in the report.
+  dproject d5
+  echo '{"health": 503}' > "$WR_STATE/new.json"
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke /health --wait 0 --no-rollback >out 2>err; code=$?
+  [ $code = 4 ] && ! grep -q '^rollback' "$WR_LOG" && [ "$(lines "$WR_LOG")" = 3 ] && has out 'the rollback is off: the new version stays' \
+    && has out "rollback:    wrangler rollback v-old --message 'roc-cfw rollback' --yes" && [ "$(cat "$WR_STATE/live")" = new ] \
+    && ok "deploy: smoke fails with --no-rollback, no rollback, exit 4" || { bad "deploy: --no-rollback (code $code)"; cat out err "$WR_LOG"; }
+
+  # The rollback fails: exit 4.
+  dproject d5b
+  echo '{"health": 500}' > "$WR_STATE/new.json"
+  WR_ROLLBACK_CODE=1 PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke /health --wait 0 >out 2>err; code=$?
+  [ $code = 4 ] && grep -q '^rollback v-old' "$WR_LOG" && has out 'the rollback failed' && ok "deploy: the rollback fails, exit 4" || { bad "deploy: rollback fails (code $code)"; cat out err; }
+
+  # Dry run: preflight and `wrangler deploy --dry-run` only, with --env and --config passed on.
+  dproject d6
+  PATH=$DPATH "$CFW" deploy --dry-run --env staging --config wrangler.toml --migrate DB >out 2>err; code=$?
+  [ $code = 0 ] && [ "$(cat "$WR_LOG")" = "deploy --dry-run --env staging --config wrangler.toml" ] && has out 'STUB args=\["sync","--file","main.roc","--wasm","app.wasm","--check","--config","wrangler.toml"\]' \
+    && has out 'dry run passed. Nothing changed.' && ok "deploy: dry run, one wrangler call, no remote change" || { bad "deploy: dry run (code $code)"; cat out err "$WR_LOG"; }
+
+  # Same-body check: the body after the deploy differs from the body before. Rollback, exit 3.
+  dproject d7
+  echo '{"data": "data-v2"}' > "$WR_STATE/new.json"
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke-same /data --wait 0 >out 2>err; code=$?
+  [ $code = 3 ] && has out 'smoke FAIL GET /data: the body is not the body before the deploy' && grep -q '^rollback v-old' "$WR_LOG" \
+    && ok "deploy: same-body mismatch, rollback, exit 3" || { bad "deploy: same-body mismatch (code $code)"; cat out err "$WR_LOG"; }
+  # A same-body check whose before read fails: exit 1 before any change (only the status read).
+  dproject d7b
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke-same /gone --wait 0 >out 2>err; code=$?
+  [ $code = 1 ] && [ "$(cat "$WR_LOG")" = "deployments status --json" ] && has err 'before the deploy, GET /gone gave status 404' && ok "deploy: before read fails, exit 1, nothing changed" || { bad "deploy: before read (code $code)"; cat err "$WR_LOG"; }
+
+  # --env and --config go to each wrangler call. A gradual deploy splits the traffic with the old version.
+  dproject d8
+  PATH=$DPATH "$CFW" deploy --env staging --config wrangler.toml --percent 10 --migrate DB --message m8 >out 2>err; code=$?
+  [ $code = 0 ] && [ "$(grep -vc -- '--env staging --config wrangler.toml$' "$WR_LOG")" = 0 ] && [ "$(lines "$WR_LOG")" = 5 ] \
+    && grep -q '^versions deploy v-new@10% v-old@90% --message m8 --yes' "$WR_LOG" && ok "deploy: --env and --config on each call, percent 10" || { bad "deploy: --env/--config/percent (code $code)"; cat err "$WR_LOG"; }
+
+  # No live version: exit 1 after the status call. --first: no status call, a failed check keeps the new version (exit 4).
+  dproject d9
+  WR_LIVE= PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ "$(cat "$WR_LOG")" = "deployments status --json" ] && has err 'use --first' && ok "deploy: no live version, exit 1, nothing changed" || { bad "deploy: no live version (code $code)"; cat err; }
+  rm -f "$WR_LOG"; touch "$WR_LOG"; echo '{"health": 500}' > "$WR_STATE/new.json"
+  WR_LIVE= PATH=$DPATH "$CFW" deploy --first --url "$BASE" --smoke /health --wait 0 --message m9 >out 2>err; code=$?
+  [ $code = 4 ] && [ "$(head -1 "$WR_LOG")" = "versions upload --message m9" ] && ! grep -q '^rollback' "$WR_LOG" && has out 'there is no rollback target' \
+    && ok "deploy: --first, no status call, failed check keeps the new version, exit 4" || { bad "deploy: --first (code $code)"; cat out err "$WR_LOG"; }
+
+  # Upload with no version id: exit 1, no deploy call.
+  dproject d10
+  WR_NEW=none PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ "$(lines "$WR_LOG")" = 2 ] && has err 'no "Worker Version ID:" line' && ok "deploy: no version id from the upload, exit 1, no deploy call" || { bad "deploy: no version id (code $code)"; cat err "$WR_LOG"; }
+
+  # Bad settings: exit 2, nothing runs. A typo in roc-cfw.toml, an unknown flag, checks with no URL.
+  dproject d11
+  printf '[[deploy.smoke]]\npath = "/"\nsame_body = true\n' > roc-cfw.toml
+  PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 2 ] && [ ! -s "$WR_LOG" ] && ! has out STUB && has err 'unknown key deploy.smoke same_body' && ok "deploy: typo in roc-cfw.toml, exit 2, nothing runs" || { bad "deploy: bad roc-cfw.toml (code $code)"; cat err; }
+  rm roc-cfw.toml
+  PATH=$DPATH "$CFW" deploy --smoke / >out 2>err; code=$?
+  [ $code = 2 ] && has err 'need a base URL' && ok "deploy: checks with no URL, exit 2" || bad "deploy: no URL (code $code)"
+  PATH=$DPATH "$CFW" deploy --bogus >out 2>err; code=$?
+  [ $code = 2 ] && [ ! -s "$WR_LOG" ] && ok "deploy: unknown flag, exit 2" || bad "deploy: unknown flag (code $code)"
+  # No wrangler on PATH: exit 2 at the first wrangler call (still before any change).
+  PATH="$WORK/nodebin:$WORK/tlnbin" "$CFW" deploy >out 2>err; code=$?
+  [ $code = 2 ] && has err 'cannot start wrangler' && ok "deploy: no wrangler, exit 2" || { bad "deploy: no wrangler (code $code)"; cat err; }
+  cd "$WORK" || exit 1
 
   # The real js/ of the platform repository (read only): the copy, then `cli.mjs sync` on a built example. Skipped when the repository is not there.
   # The wasm is the prebuilt hello.wasm of the platform repository (its test-bundle cache), since the build of the platform needs its zig chain.

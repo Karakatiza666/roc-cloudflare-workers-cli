@@ -22,6 +22,7 @@ The default key of a tool is the name of the repository (`roc-cloudflare-workers
 | `roc-cfw shim [--file main.roc] [--js <dir>]` | Finds `js/` of the platform of the app. Checks `js/cfw.json`. Copies `js/` to `.roc-cfw/` when the stamp is not the platform hash. Runs no node. |
 | `roc-cfw sync [--file main.roc] [--js <dir>] [sync args]` | `shim`, then `node .roc-cfw/cli.mjs sync --file <app file> [sync args]`. The exit code of node is the exit code. The flag `--js` is not passed on. The flag `--file` is passed on (see below). |
 | `roc-cfw init [--file main.roc] [--js <dir>] [--name <name>]` | Writes the template of the platform (see "init"). |
+| `roc-cfw deploy [--file main.roc] [--js <dir>] [deploy flags]` | Preflight (wasm age, `sync --check`), records the live version, applies D1 migrations (opt-in), `wrangler versions upload` and `versions deploy`, smoke checks, and a rollback when a check fails. See "deploy" and `docs/deploy.md`. |
 | `roc-cfw help` | Prints the usage. |
 
 The directory for `.roc-cfw/` is the current directory. The files of `init` are in the directory of the app file.
@@ -33,7 +34,9 @@ The directory for `.roc-cfw/` is the current directory. The files of `init` are 
 | 0 | Good |
 | 1 | A failure: a platform that is not in the cache after `roc check`, no or bad `js/cfw.json`, no `template/` file, a file that `init` would write over, a `talon.toml` that does not parse (the line and column are in the message), a `talon.toml` with a `scripts` key that is not a table, a copy that failed |
 | 2 | A bad command line, no app file, no platform entry, a URL that is not a release URL, an `api` that this version does not know, node that does not start |
-| n | `sync`: the exit code of `cli.mjs` (0 good, 1 a part is missing or wrong, 2 a bad command line or no app) |
+| 3 | `deploy`: a smoke check failed, and the rollback passed (the old version is live) |
+| 4 | `deploy`: a smoke check failed, and there was no rollback (`--no-rollback`, `--first`, or the rollback failed). The new version is live. |
+| n | `sync`, and the preflight of `deploy`: the exit code of `cli.mjs` (0 good, 1 a part is missing or wrong, 2 a bad command line or no app) |
 
 ## Flow of shim and sync
 
@@ -118,14 +121,54 @@ The merge of `talon.toml` takes each key of the `[scripts]` table of the templat
 | The key has the template value | No change |
 | The key has another value | The value of the user stays. One note line on stderr: `talon.toml: [scripts] <key> kept (not the template value)`. Exit 0. |
 
+## deploy
+
+`roc-cfw deploy` is general: it works for each app of the platform. The design is in `docs/deploy.md` (the flags, `roc-cfw.toml`, the steps, the exit codes).
+
+| Step | Command | On a failure |
+| --- | --- | --- |
+| 1 Preflight | `app.wasm` is there and is not older than a `.roc` file of the app directory (not with `--wasm`); `shim`; `node .roc-cfw/cli.mjs sync --check` | Stop. No `wrangler` command ran. |
+| 2 Live version | `wrangler deployments status --json`. The id and the rollback command are printed. (`--first`: no read.) | Exit 1, nothing changed |
+| 3 Before reads | `GET` of each same-body check | Exit 1, nothing changed |
+| 4 Migrations (opt-in) | `wrangler d1 migrations list <binding> --remote`, then `apply` | Exit 1, nothing uploaded |
+| 5 Upload | `wrangler versions upload --message <m>`: the new version id | Exit 1, the live version did not change |
+| 6 Deploy | `wrangler versions deploy <new>@100% --message <m> --yes` (or `<new>@p% <old>@(100-p)%` with `--percent`) | Exit 1, with the rollback command |
+| 7 Smoke checks | `GET <url><path>`, the status, and the body for a same-body check (3 tries) | Step 8 |
+| 8 Rollback | `wrangler rollback <old> --message "roc-cfw: smoke check failed" --yes` (not with `--no-rollback`) | Exit 3 when it passed, exit 4 when not |
+
+`--dry-run` runs step 1 and `wrangler deploy --dry-run` only. `--env <name>` and `--config <file>` go to each `wrangler` command. The default message is `roc-cfw <version> <git commit>` (`-dirty` when the tree has changes).
+
+The smoke checks come from flags (`--url`, `--smoke /path[=status]`, `--smoke-same /path[=status]`) or from `[deploy]` in `roc-cfw.toml` (the current directory). Not `talon.toml`: Talon gives a warning for an unknown table at each run.
+
+```toml
+[deploy]
+url = "https://my-app.my-account.workers.dev"
+migrate = ["DB"]
+
+[[deploy.smoke]]
+path = "/"
+
+[[deploy.smoke]]
+path = "/v1/index.json"
+same-body = true
+```
+
+The `deploy` script of the template of the platform is `["@check", "wrangler deploy"]`. With `roc-cfw` 0.0.2 or later, use:
+
+```toml
+deploy = ["@check", "roc-cfw deploy"]
+```
+
+`deploy` does not tail logs, check queues, or run app tests: these are specific to an app. Put them in the `deploy` script before or after `roc-cfw deploy`.
+
 ## Tests
 
 `scripts/test.sh [unit|e2e]`.
 
 | Layer | Files | Checks |
 | --- | --- | --- |
-| unit | `tests/*.roc`, run with `roc check`, `roc fmt --check`, `roc test` | The pure decisions of `lib/`: the command line, the platform entry and alias, the `tln path` arguments and output, the cache path, the api check, the stamp rule, the 4 template merges |
-| e2e | `fixtures/`: a fake platform package (`js/cfw.json`, a stub `cli.mjs`, a template), an app with a release URL, a fake `roc`, a fake `tln` | The built `roc-cfw`: copy, stamp, arguments, exit code, unknown api, `tln path` and the fallbacks, `--file`, `--js`, `init` and the `talon.toml` merge |
+| unit | `tests/*.roc`, run with `roc check`, `roc fmt --check`, `roc test` | The pure decisions of `lib/`: the command line, the platform entry and alias, the `tln path` arguments and output, the cache path, the api check, the stamp rule, the 4 template merges, the `deploy` settings, wrangler arguments, outputs and smoke results |
+| e2e | `fixtures/`: a fake platform package (`js/cfw.json`, a stub `cli.mjs`, a template), an app with a release URL, a fake `roc`, a fake `tln`, a fake `wrangler` and a fake Worker on 127.0.0.1 (`fixtures/deploy/`) | The built `roc-cfw`: copy, stamp, arguments, exit code, unknown api, `tln path` and the fallbacks, `--file`, `--js`, `init` and the `talon.toml` merge, `deploy` (success, preflight failures with no wrangler call, migrations, smoke failure with and with no rollback, dry run, same-body mismatch, `--env`, `--first`, bad settings). No test reaches Cloudflare. |
 | platform | `scripts/test_platform.sh [<platform repo dir>]` | The real JS of the platform repository, with no release and no deploy (see below) |
 
 Use the pinned compiler (the nightly in `.roc-version`). `scripts/get-roc.sh` finds it, in this order:
@@ -155,8 +198,9 @@ Build with `roc build --no-cache --output=roc-cfw main.roc`. The e2e layer runs 
 
 | Path | Holds |
 | --- | --- |
-| `main.roc` | The app: the effects (files, `node`, `roc check`) and the order of the steps |
-| `lib/` | The pure decisions: `Args`, `Cfw`, `Platform`, `Scaffold`. They use `roc-app-header` 0.1.0 and `roc-toml` 0.1.0 by release URL. |
+| `main.roc` | The app: the effects (files, `node`, `roc check`, `wrangler`, `git`, HTTP) and the order of the steps |
+| `lib/` | The pure decisions: `Args`, `Cfw`, `Deploy`, `Platform`, `Scaffold`. They use `roc-app-header` 0.1.0 and `roc-toml` 0.1.0 by release URL. `main.roc` also uses `roc-lang/http` 1.0.0 (the request type of `Http.send!`). |
+| `docs/deploy.md` | The design of `deploy` |
 | `scripts/` | `test.sh` (unit, build and e2e), `test_platform.sh` (the real platform JS), `get-roc.sh` (the pinned compiler), `bundle.sh` (the app bundle), `test_bundle.sh` (unbundle, build and run the bundle) |
 | `.github/workflows/` | `ci.yml` (tests), `release.yml` (the release on a tag) |
 | `.github/release-notes.md` | The text of the notes of a release |

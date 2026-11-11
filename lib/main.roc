@@ -3,6 +3,7 @@ package
 	[
 		Args,
 		Cfw,
+		Deploy,
 		Platform,
 		Scaffold,
 	]

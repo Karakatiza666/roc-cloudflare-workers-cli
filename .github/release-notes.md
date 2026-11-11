@@ -9,6 +9,7 @@
 | Pin the tool in the project | `tln add --tool Karakatiza666/roc-cloudflare-workers-cli --as roc-cfw` |
 | Write the template of the platform | `tln x roc-cfw -- init` |
 | Build and sync | `tln run build` |
+| Deploy (preflight, versions upload and deploy, smoke checks, rollback) | `deploy = ["@check", "roc-cfw deploy"]` in `[scripts]`, then `tln run deploy` (see `docs/deploy.md`) |
 
 The first command builds `roc-cfw` and writes the `[tools]` entry in `talon.toml`. The entry holds the URL of this bundle, so each project pins its own version.
 

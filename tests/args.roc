@@ -85,3 +85,11 @@ expect {
 		Err(_) => Bool.False
 	}
 }
+
+# `deploy`: `--file` and `--js` stay with the helper, all other arguments go to `Deploy.flags` in order.
+expect {
+	match ok_of(["deploy", "--env", "staging", "--file", "web.roc", "--smoke", "/", "--js", "../js", "--dry-run"]) {
+		Ok(p) => p.cmd == Deploy and p.file == "web.roc" and p.js == Dir("../js") and p.rest == ["--env", "staging", "--smoke", "/", "--dry-run"]
+		Err(_) => Bool.False
+	}
+}

@@ -4,3 +4,4 @@
 *.wasm
 /.cache/
 /dist/
+/.tmp/

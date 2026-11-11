@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# A fake wrangler for the deploy tests. It never reaches Cloudflare. Each call appends its arguments (one line) to $WR_LOG.
+# $WR_STATE/live is "old" or "new": the version that the fake server (server.mjs) serves. `versions deploy` sets "new",
+# `rollback` sets "old".
+#   WR_LIVE           the version id of `deployments status --json` (empty: "no deployments", exit 1)
+#   WR_NEW            the id in the output of `versions upload` (default v-new; "none": no id line)
+#   WR_UPLOAD_CODE    the exit code of `versions upload` (default 0)
+#   WR_ROLLBACK_CODE  the exit code of `rollback` (default 0)
+echo "$*" >> "${WR_LOG:?}"
+case "$1 $2" in
+  "deployments status")
+    if [ -z "${WR_LIVE-v-old}" ]; then echo "X [ERROR] The Worker app has no deployments." >&2; exit 1; fi
+    printf '{\n  "id": "dep-1",\n  "source": "api",\n  "strategy": "percentage",\n  "versions": [\n    { "version_id": "%s", "percentage": 100 }\n  ]\n}\n' "${WR_LIVE-v-old}"
+    ;;
+  "versions upload")
+    echo "Total Upload: 120.00 KiB / gzip: 40.00 KiB"
+    echo "Uploaded app (1.00 sec)"
+    [ "${WR_NEW:-v-new}" = none ] || echo "Worker Version ID: ${WR_NEW:-v-new}"
+    echo "Version Preview URL: https://v-new-app.example.workers.dev"
+    exit "${WR_UPLOAD_CODE:-0}"
+    ;;
+  "versions deploy")
+    echo new > "$WR_STATE/live"; echo "Deployed app version $3"
+    ;;
+  "rollback "*)
+    [ "${WR_ROLLBACK_CODE:-0}" = 0 ] && echo old > "$WR_STATE/live"
+    echo "Rolled back to $2"; exit "${WR_ROLLBACK_CODE:-0}"
+    ;;
+  "d1 migrations")
+    if [ "$3" = list ]; then printf 'Migrations to be applied:\n  0002_add_index.sql\n'; else echo "applied 0002_add_index.sql"; fi
+    ;;
+  "deploy --dry-run")
+    echo "--dry-run: exiting now."
+    ;;
+  *)
+    echo "fake wrangler: unknown command $*" >&2; exit 9
+    ;;
+esac
