@@ -356,15 +356,15 @@ dir_name! = |dir| {
 
 # ---- deploy ----
 
-## `deploy` (docs/deploy.md). The decisions are in `lib/Deploy.roc`. A failure before step 5 changes nothing remote.
+## `deploy` (docs/deploy.md). The decisions are in `lib/Deploy.roc`. A failure before step 4 (upload) changes nothing remote.
 deploy! : Opts => Try({}, [Exit(I32)])
 deploy! = |opts| {
-	settings = match Deploy.file(read_or_empty!("roc-cfw.toml")) {
-		Ok(s) => s
-		Err(message) => return die!(2, message)
-	}
 	given = match Deploy.flags(opts.rest) {
 		Ok(f) => f
+		Err(message) => return die!(2, message)
+	}
+	settings = match Deploy.file(read_or_empty!("roc-cfw.toml"), given.env) {
+		Ok(s) => s
 		Err(message) => return die!(2, message)
 	}
 	p = match Deploy.plan(settings, given) {
@@ -400,7 +400,10 @@ deploy! = |opts| {
 	message = if p.message != "" p.message else default_message!({})
 
 	if p.dry_run {
-		note!("dry run: message \"${message}\", percent ${p.percent.to_str()}, migrations: ${list_text(p.migrate)}, smoke checks: ${p.smoke.len().to_str()}")
+		_ = Stdout.line!("deploy plan (dry run):")
+		for line in Deploy.plan_lines(p, message) {
+			_ = Stdout.line!("  ${line}")
+		}
 		r = wrangler!(Deploy.dry_run_args(p), Inherit)?
 		if r.code != 0 {
 			return die!(1, "wrangler deploy --dry-run exited with ${r.code.to_str()}")
@@ -409,23 +412,24 @@ deploy! = |opts| {
 		return Ok({})
 	}
 
-	# 2. The live version: the rollback target.
+	# 2. The live version: the rollback target. With --first: a check that there is none.
+	status = wrangler!(Deploy.status_args(p), Capture)?
 	old = if p.first {
-		note!("--first: no live version is read, so there is no rollback target")
-		""
-	} else {
-		r = wrangler!(Deploy.status_args(p), Capture)?
-		if r.code != 0 {
-			return die!(1, "wrangler deployments status exited with ${r.code.to_str()}: cannot read the live version. Nothing changed. For the first deploy of a Worker, use --first.")
-		}
-		match Deploy.live(r.out) {
-			Ok(v) => {
-				if v.split {
-					note!("the live deployment has more than one version: the target is ${v.id} (${v.percent.to_str()}%)")
-				}
-				v.id
+		match Deploy.first_check(status.code, status.out) {
+			Ok(_) => {
+				note!("--first: the Worker has no live version, so there is no rollback target")
+				""
 			}
-			Err(_) => return die!(1, "no version in the output of wrangler deployments status --json. Nothing changed. For the first deploy of a Worker, use --first.")
+			Err(id) => return die!(1, "--first, but the Worker has a live version (${id}). Deploy with no --first: then ${id} is the rollback target. Nothing changed.")
+		}
+	} else {
+		if status.code != 0 {
+			return die!(1, "wrangler deployments status exited with ${status.code.to_str()}: cannot read the live version. Nothing changed. For the first deploy of a Worker, use --first.")
+		}
+		match Deploy.live(status.out) {
+			Ok(id) => id
+			Err(Split(versions)) => return die!(1, Deploy.split_message(p, versions))
+			Err(NoVersion) => return die!(1, "no version in the output of wrangler deployments status --json. Nothing changed. For the first deploy of a Worker, use --first.")
 		}
 	}
 	rollback_line = if old == "" "none (no live version)" else Deploy.shell("wrangler", Deploy.rollback_args(p, old, "roc-cfw rollback"))
@@ -434,15 +438,17 @@ deploy! = |opts| {
 		note!("rollback command: ${rollback_line}")
 	}
 
-	# 3. The before reads of the same-body checks.
+	# 3. The before reads of the same-body checks (3 tries).
 	var $befores = []
 	for check in p.smoke {
 		before = if check.same and old != "" {
-			url = Deploy.url_of(p.url, check.path)
-			match get!(url) {
-				Got(r) if r.status == check.status => Some(r.body)
-				Got(r) => return die!(1, "before the deploy, GET ${check.path} gave status ${r.status.to_str()}, not ${check.status.to_str()}: the same-body check needs a good answer to compare. Nothing changed.")
-				Failed(why) => return die!(1, "before the deploy, GET ${check.path}: ${why}. Nothing changed.")
+			body = match before_read!(p, check) {
+				Ok(b) => b
+				Err(why) => return die!(1, "before the deploy, ${why}. Nothing changed.")
+			}
+			match Deploy.before_check(check, body) {
+				Ok(_) => Some(body)
+				Err(why) => return die!(1, "before the deploy, ${why}. Nothing changed.")
 			}
 		} else {
 			if check.same {
@@ -453,40 +459,65 @@ deploy! = |opts| {
 		$befores = $befores.append(before)
 	}
 
-	# 4. The D1 migrations: the pending list first, then apply.
-	for binding in p.migrate {
-		listed = wrangler!(Deploy.migrations_args(p, List, binding), Inherit)?
-		if listed.code != 0 {
-			return die!(1, "wrangler d1 migrations list ${binding} exited with ${listed.code.to_str()}. Nothing was uploaded.")
-		}
-		applied = wrangler!(Deploy.migrations_args(p, Apply, binding), Inherit)?
-		if applied.code != 0 {
-			return die!(1, "wrangler d1 migrations apply ${binding} exited with ${applied.code.to_str()}. Nothing was uploaded. The migrations that were applied stay.")
-		}
-	}
-
-	# 5. Upload.
+	# 4. Upload. The new version gets no traffic yet.
 	up = wrangler!(Deploy.upload_args(p, message), Tee)?
 	if up.code != 0 {
-		return die!(1, "wrangler versions upload exited with ${up.code.to_str()}. The live version did not change.")
+		return die!(1, "wrangler versions upload exited with ${up.code.to_str()}. Nothing changed.")
 	}
 	new = match Deploy.version_id(up.out) {
 		Ok(id) => id
 		Err(_) => return die!(1, "no \"Worker Version ID:\" line in the output of wrangler versions upload. The live version did not change.")
 	}
-	note!("new version: ${new}")
+	note!("new version: ${new} (uploaded, no traffic yet)")
+
+	# 5. The D1 migrations: the pending list, apply with no terminal (no prompt), then the pending list must be empty.
+	var $applied = []
+	for binding in p.migrate {
+		stop! = |why, done| {
+			schema_now = Deploy.schema_note(done)
+			text = if schema_now == "" "" else " The schema is ${schema_now}."
+			die!(1, "${why} The live version did not change (${new} is uploaded, not deployed).${text}")
+		}
+		listed = wrangler!(Deploy.migrations_args(p, List, binding), Tee)?
+		if listed.code != 0 {
+			return stop!("wrangler d1 migrations list ${binding} exited with ${listed.code.to_str()}.", $applied)
+		}
+		names = match Deploy.pending(listed.out) {
+			Ok(n) => n
+			Err(Unknown) => return stop!("cannot read the pending migrations of ${binding} in the output of wrangler d1 migrations list.", $applied)
+		}
+		if names.is_empty() {
+			note!("${binding}: no pending migrations")
+		} else {
+			note!(Deploy.migration_note(binding, names))
+			applied = wrangler!(Deploy.migrations_args(p, Apply, binding), Inherit)?
+			after = wrangler!(Deploy.migrations_args(p, List, binding), Capture)?
+			left = match Deploy.pending(after.out) {
+				Ok(n) if after.code == 0 => n
+				_ => return stop!("cannot verify the migrations of ${binding}: wrangler d1 migrations list after the apply gave no pending list (apply exit ${applied.code.to_str()}). Check them with: ${Deploy.shell("wrangler", Deploy.migrations_args(p, List, binding))}", $applied)
+			}
+			$applied = $applied.concat(names.keep_if(|n| !left.contains(n)).map(|n| "${binding} ${n}"))
+			if applied.code != 0 or !left.is_empty() {
+				return stop!("the migrations of ${binding} were not all applied (wrangler d1 migrations apply exit ${applied.code.to_str()}; still pending: ${list_text(left)}).", $applied)
+			}
+		}
+	}
+	schema = Deploy.schema_note($applied)
 
 	# 6. Deploy.
 	dep = wrangler!(Deploy.deploy_args(p, { new, old, message }), Inherit)?
 	if dep.code != 0 {
 		note!("rollback command: ${rollback_line}")
+		if schema != "" {
+			note!("schema: ${schema}")
+		}
 		return die!(1, "wrangler versions deploy exited with ${dep.code.to_str()}. Check the live version with wrangler deployments status.")
 	}
 
 	# 7. Smoke checks.
 	if p.smoke.is_empty() {
 		note!("no smoke checks (--smoke, or [[deploy.smoke]] in roc-cfw.toml)")
-	} else if p.percent < 100 {
+	} else if p.percent < 100 and old != "" {
 		note!("percent ${p.percent.to_str()}: a smoke check can reach the old or the new version")
 	}
 	var $failed = []
@@ -494,7 +525,7 @@ deploy! = |opts| {
 		_ = Sleep.millis!(p.wait * 1000)
 	}
 	for (check, before) in p.smoke.map2($befores, |c, b| (c, b)) {
-		match smoke_one!({ url: p.url, wait: p.wait }, check, before) {
+		match smoke_one!(p, check, before) {
 			Pass => {
 				_ = Stdout.line!("smoke ok   GET ${check.path}")
 			}
@@ -508,9 +539,12 @@ deploy! = |opts| {
 	# 8. The end: done, rollback, or keep.
 	report! = |state| {
 		_ = Stdout.line!("deploy: ${state}")
-		_ = Stdout.line!("  new version: ${new} (${p.percent.to_str()}%)")
+		_ = Stdout.line!("  new version: ${new} (${if old == "" "100" else p.percent.to_str()}%)")
 		_ = Stdout.line!("  old version: ${if old == "" "none" else old}")
 		_ = Stdout.line!("  rollback:    ${rollback_line}")
+		if schema != "" {
+			_ = Stdout.line!("  schema:      ${schema}")
+		}
 		{}
 	}
 	match Deploy.after_smoke({ failed: $failed.len(), rollback: p.rollback, target: old != "" }) {
@@ -532,6 +566,11 @@ deploy! = |opts| {
 		Keep => {
 			why = if old == "" "there is no rollback target" else "the rollback is off"
 			report!("smoke check failed, ${why}: the new version stays")
+			if old == "" {
+				for line in Deploy.first_next(p) {
+					_ = Stdout.line!("  ${line}")
+				}
+			}
 			Err(Exit(Deploy.exit_of(Kept)))
 		}
 	}
@@ -540,8 +579,31 @@ deploy! = |opts| {
 list_text : List(Str) -> Str
 list_text = |items| if items.is_empty() "none" else Str.join_with(items, ", ")
 
+## The before read of a same-body check: up to 3 tries, `wait` seconds apart. The first answer with the status wins.
+before_read! : _, { path : Str, status : U16, same : Bool, ignore : List(Str) } => Try(List(U8), Str)
+before_read! = |p, check| {
+	var $why = "no try"
+	var $tries = 0
+	while $tries < 3 {
+		if $tries > 0 {
+			_ = Sleep.millis!(p.wait * 1000)
+		}
+		match get!(Deploy.url_of(p.url, check.path), p.timeout) {
+			Got(r) if r.status == check.status => return Ok(r.body)
+			Got(r) => {
+				$why = "GET ${check.path} gave status ${r.status.to_str()}, not ${check.status.to_str()}: the same-body check needs a good answer to compare"
+			}
+			Failed(why) => {
+				$why = "GET ${check.path}: ${why}"
+			}
+		}
+		$tries = $tries + 1
+	}
+	Err($why)
+}
+
 ## One smoke check: up to 3 tries, `wait` seconds apart. The first pass wins.
-smoke_one! : { url : Str, wait : U64 }, { path : Str, status : U16, same : Bool }, [None, Some(List(U8))] => [Pass, Fail(Str)]
+smoke_one! : _, { path : Str, status : U16, same : Bool, ignore : List(Str) }, [None, Some(List(U8))] => [Pass, Fail(Str)]
 smoke_one! = |p, check, before| {
 	var $result = Fail("no try")
 	var $tries = 0
@@ -549,16 +611,16 @@ smoke_one! = |p, check, before| {
 		if $tries > 0 {
 			_ = Sleep.millis!(p.wait * 1000)
 		}
-		$result = Deploy.judge({ smoke: check, before, got: get!(Deploy.url_of(p.url, check.path)) })
+		$result = Deploy.judge({ smoke: check, before, got: get!(Deploy.url_of(p.url, check.path), p.timeout) })
 		$tries = if $result == Pass 3 else $tries + 1
 	}
 	$result
 }
 
-## A GET with a time limit of 30 seconds.
-get! : Str => [Failed(Str), Got({ status : U16, body : List(U8) })]
-get! = |url| {
-	request = Request.from_method(GET).with_uri(url).with_timeout(TimeoutMilliseconds(30000))
+## A GET with a time limit (`--timeout`, seconds).
+get! : Str, U64 => [Failed(Str), Got({ status : U16, body : List(U8) })]
+get! = |url, timeout| {
+	request = Request.from_method(GET).with_uri(url).with_timeout(TimeoutMilliseconds(timeout * 1000))
 	match Http.send!(request, {}) {
 		Ok(response) => Got({ status: response.status(), body: response.body() })
 		Err(InvalidUrl(_)) => Failed("the URL ${url} is not valid")
@@ -567,8 +629,9 @@ get! = |url| {
 	}
 }
 
-## Runs `wrangler <args>`. The command line goes to stderr first. `Capture` keeps stdout, `Tee` keeps it and shows it.
-## A wrangler that does not start is exit 2.
+## Runs `wrangler <args>` with no terminal on stdin, so wrangler never asks a question: it uses its non-interactive answer
+## (yes for `d1 migrations apply`), and the result does not depend on a person at the terminal.
+## The command line goes to stderr first. `Capture` keeps stdout, `Tee` keeps it and shows it. A wrangler that does not start is exit 2.
 wrangler! : List(Str), [Inherit, Capture, Tee] => Try({ code : I32, out : Str }, [Exit(I32)])
 wrangler! = |args, mode| {
 	note!("run: ${Deploy.shell("wrangler", args)}")
@@ -577,7 +640,7 @@ wrangler! = |args, mode| {
 		Capture => Capture
 		Tee => Tee
 	}
-	cmd = command("wrangler", args).stdin(Inherit).stdout(out_mode).stderr(Inherit)
+	cmd = command("wrangler", args).stdin(Null).stdout(out_mode).stderr(Inherit)
 	match cmd.run!() {
 		Ok(out) => {
 			text = Str.from_utf8_lossy(out.stdout_bytes)

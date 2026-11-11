@@ -199,6 +199,7 @@ FAKE
     project "$1"; cd "$WORK/$1" || exit 1
     touch -d 2026-01-01T00:00:00 main.roc; printf '\0asm' > app.wasm
     echo old > "$WR_STATE/live"; echo '{}' > "$WR_STATE/new.json"; rm -f "$WR_LOG"; touch "$WR_LOG"
+    printf '0002_add_index.sql\n' > "$WR_STATE/pending"
   }
   DPATH="$WORK/wrbin:$PATH"
   # The number of lines of a file (macOS wc pads it with spaces).
@@ -209,8 +210,8 @@ FAKE
   PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke /health --smoke-same /data --wait 0 >out 2>err; code=$?
   [ $code = 0 ] && has out 'STUB args=\["sync","--file","main.roc","--wasm","app.wasm","--check"\]' \
     && [ "$(sed -n 1p "$WR_LOG")" = "deployments status --json" ] \
-    && sed -n 2p "$WR_LOG" | grep -q '^versions upload --message roc-cfw 0\.0\.2' \
-    && sed -n 3p "$WR_LOG" | grep -q '^versions deploy v-new@100% --message roc-cfw 0\.0\.2 .* --yes$' \
+    && sed -n 2p "$WR_LOG" | grep -q '^versions upload --message roc-cfw 0\.0\.3' \
+    && sed -n 3p "$WR_LOG" | grep -q '^versions deploy v-new@100% --message roc-cfw 0\.0\.3 .* --yes$' \
     && [ "$(lines "$WR_LOG")" = 3 ] && has out '^smoke ok   GET /health' && has out '^smoke ok   GET /data' && has out '^deploy: done' \
     && has err "rollback command: wrangler rollback v-old --message 'roc-cfw rollback' --yes" && [ "$(cat "$WR_STATE/live")" = new ] \
     && ok "deploy: success, 3 wrangler calls, smoke ok, rollback command printed" || { bad "deploy: success (code $code)"; cat out err "$WR_LOG"; }
@@ -230,12 +231,44 @@ FAKE
   PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
   [ $code = 1 ] && [ ! -s "$WR_LOG" ] && has err 'app.wasm is not there' && ok "deploy: no wasm, exit 1, no wrangler call" || { bad "deploy: no wasm (code $code)"; cat err; }
 
-  # Migrations from roc-cfw.toml: the pending list, then apply, before the upload. The file also gives the url and a check.
+  # Migrations from roc-cfw.toml: after the upload, the pending list, apply, the pending list again (it must be empty), then the deploy.
+  # A "n" on stdin does not reach wrangler (stdin is not passed on), so the answer is not a person's: the apply is done.
   dproject d3
   printf '[deploy]\nurl = "%s"\nmigrate = ["DB"]\nwait = 0\n\n[[deploy.smoke]]\npath = "/health"\n' "$BASE" > roc-cfw.toml
-  PATH=$DPATH "$CFW" deploy --message m3 >out 2>err; code=$?
-  [ $code = 0 ] && [ "$(cat "$WR_LOG")" = "$(printf 'deployments status --json\nd1 migrations list DB --remote\nd1 migrations apply DB --remote\nversions upload --message m3\nversions deploy v-new@100%% --message m3 --yes')" ] \
-    && has out '0002_add_index.sql' && has out '^smoke ok   GET /health' && ok "deploy: migrations listed, then applied, before the upload (roc-cfw.toml)" || { bad "deploy: migrations (code $code)"; cat out err "$WR_LOG"; }
+  echo n | PATH=$DPATH "$CFW" deploy --message m3 >out 2>err; code=$?
+  [ $code = 0 ] && [ "$(cat "$WR_LOG")" = "$(printf 'deployments status --json\nversions upload --message m3\nd1 migrations list DB --remote\nd1 migrations apply DB --remote\nd1 migrations list DB --remote\nversions deploy v-new@100%% --message m3 --yes')" ] \
+    && has out '0002_add_index.sql' && has err 'DB: 1 pending migration: 0002_add_index.sql. Migrations are forward-only' && has out '^smoke ok   GET /health' \
+    && has out '^  schema:      migrated (forward-only, a rollback does not undo it): DB 0002_add_index.sql' && [ ! -s "$WR_STATE/pending" ] \
+    && ok "deploy: upload, then migrations listed, applied with no prompt and verified, then deploy" || { bad "deploy: migrations (code $code)"; cat out err "$WR_LOG"; }
+
+  # The apply applies nothing and exits 0 (as wrangler after a "no"): the check after the apply finds the pending list. Exit 1, no deploy.
+  dproject d3b
+  WR_APPLY=no PATH=$DPATH "$CFW" deploy --migrate DB --message m3b >out 2>err; code=$?
+  [ $code = 1 ] && ! grep -q '^versions deploy' "$WR_LOG" && [ "$(tail -1 "$WR_LOG")" = "d1 migrations list DB --remote" ] \
+    && has err 'the migrations of DB were not all applied (wrangler d1 migrations apply exit 0; still pending: 0002_add_index.sql)' \
+    && has err 'The live version did not change (v-new is uploaded, not deployed)' && [ "$(cat "$WR_STATE/live")" = old ] \
+    && ok "deploy: migrations not applied (exit 0 of apply), exit 1, no deploy" || { bad "deploy: migrations not applied (code $code)"; cat out err "$WR_LOG"; }
+
+  # Two pending, the second fails: exit 1, no deploy, the report names the migration that stays applied.
+  dproject d3c
+  printf '0002_add_index.sql\n0003_users.sql\n' > "$WR_STATE/pending"
+  WR_APPLY=fail PATH=$DPATH "$CFW" deploy --migrate DB >out 2>err; code=$?
+  [ $code = 1 ] && ! grep -q '^versions deploy' "$WR_LOG" && has err 'still pending: 0003_users.sql' && has err 'The schema is migrated (forward-only, a rollback does not undo it): DB 0002_add_index.sql' \
+    && ok "deploy: a migration fails, exit 1, the applied one is named" || { bad "deploy: migration fails (code $code)"; cat out err "$WR_LOG"; }
+
+  # No pending migration: no apply call.
+  dproject d3d
+  : > "$WR_STATE/pending"
+  PATH=$DPATH "$CFW" deploy --migrate DB --message m >out 2>err; code=$?
+  [ $code = 0 ] && ! grep -q 'migrations apply' "$WR_LOG" && has err 'DB: no pending migrations' && ! has out 'schema:' \
+    && ok "deploy: no pending migration, no apply" || { bad "deploy: no pending (code $code)"; cat out err "$WR_LOG"; }
+
+  # A smoke check fails after a migration: rollback (exit 3), and the report says that the schema stays migrated.
+  dproject d3e
+  echo '{"health": 500}' > "$WR_STATE/new.json"
+  PATH=$DPATH "$CFW" deploy --migrate DB --url "$BASE" --smoke /health --wait 0 >out 2>err; code=$?
+  [ $code = 3 ] && has out 'rolled back to v-old' && has out '^  schema:      migrated (forward-only, a rollback does not undo it): DB 0002_add_index.sql' \
+    && ok "deploy: smoke fails after a migration, rollback, the schema line" || { bad "deploy: schema line (code $code)"; cat out err "$WR_LOG"; }
 
   # A smoke check fails: automatic rollback to the recorded version, exit 3.
   dproject d4
@@ -263,6 +296,7 @@ FAKE
   dproject d6
   PATH=$DPATH "$CFW" deploy --dry-run --env staging --config wrangler.toml --migrate DB >out 2>err; code=$?
   [ $code = 0 ] && [ "$(cat "$WR_LOG")" = "deploy --dry-run --env staging --config wrangler.toml" ] && has out 'STUB args=\["sync","--file","main.roc","--wasm","app.wasm","--check","--config","wrangler.toml"\]' \
+    && has out '^  migrations: DB (pending list and apply after the upload; forward-only)$' && has out '^  env:        staging$' \
     && has out 'dry run passed. Nothing changed.' && ok "deploy: dry run, one wrangler call, no remote change" || { bad "deploy: dry run (code $code)"; cat out err "$WR_LOG"; }
 
   # Same-body check: the body after the deploy differs from the body before. Rollback, exit 3.
@@ -279,17 +313,63 @@ FAKE
   # --env and --config go to each wrangler call. A gradual deploy splits the traffic with the old version.
   dproject d8
   PATH=$DPATH "$CFW" deploy --env staging --config wrangler.toml --percent 10 --migrate DB --message m8 >out 2>err; code=$?
-  [ $code = 0 ] && [ "$(grep -vc -- '--env staging --config wrangler.toml$' "$WR_LOG")" = 0 ] && [ "$(lines "$WR_LOG")" = 5 ] \
+  [ $code = 0 ] && [ "$(grep -vc -- '--env staging --config wrangler.toml$' "$WR_LOG")" = 0 ] && [ "$(lines "$WR_LOG")" = 6 ] \
     && grep -q '^versions deploy v-new@10% v-old@90% --message m8 --yes' "$WR_LOG" && ok "deploy: --env and --config on each call, percent 10" || { bad "deploy: --env/--config/percent (code $code)"; cat err "$WR_LOG"; }
 
-  # No live version: exit 1 after the status call. --first: no status call, a failed check keeps the new version (exit 4).
+  # No live version: exit 1 after the status call. --first: the status call finds no version, a failed check keeps the new version (exit 4)
+  # and the report gives the next commands.
   dproject d9
   WR_LIVE= PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
   [ $code = 1 ] && [ "$(cat "$WR_LOG")" = "deployments status --json" ] && has err 'use --first' && ok "deploy: no live version, exit 1, nothing changed" || { bad "deploy: no live version (code $code)"; cat err; }
   rm -f "$WR_LOG"; touch "$WR_LOG"; echo '{"health": 500}' > "$WR_STATE/new.json"
   WR_LIVE= PATH=$DPATH "$CFW" deploy --first --url "$BASE" --smoke /health --wait 0 --message m9 >out 2>err; code=$?
-  [ $code = 4 ] && [ "$(head -1 "$WR_LOG")" = "versions upload --message m9" ] && ! grep -q '^rollback' "$WR_LOG" && has out 'there is no rollback target' \
-    && ok "deploy: --first, no status call, failed check keeps the new version, exit 4" || { bad "deploy: --first (code $code)"; cat out err "$WR_LOG"; }
+  [ $code = 4 ] && [ "$(sed -n 2p "$WR_LOG")" = "versions upload --message m9" ] && ! grep -q '^rollback' "$WR_LOG" && has out 'there is no rollback target' \
+    && has out 'take the Worker down: wrangler delete$' && ok "deploy: --first, failed check keeps the new version, exit 4, next commands" || { bad "deploy: --first (code $code)"; cat out err "$WR_LOG"; }
+  # --first on a Worker with a live version: exit 1 after the status call (the deploy would lose the rollback target).
+  rm -f "$WR_LOG"; touch "$WR_LOG"
+  PATH=$DPATH "$CFW" deploy --first >out 2>err; code=$?
+  [ $code = 1 ] && [ "$(cat "$WR_LOG")" = "deployments status --json" ] && has err '\-\-first, but the Worker has a live version (v-old)' \
+    && ok "deploy: --first with a live version, exit 1, nothing changed" || { bad "deploy: --first with a live version (code $code)"; cat err "$WR_LOG"; }
+
+  # A gradual deploy in progress (two live versions): exit 1 after the status call, with the commands that finish it.
+  dproject d9b
+  WR_SPLIT=1 PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ "$(cat "$WR_LOG")" = "deployments status --json" ] && has err 'more than one version (v-old 90%, v-a 10%)' && has err 'only v-a: wrangler versions deploy v-a@100% --yes' \
+    && ok "deploy: split live deployment, exit 1, nothing changed" || { bad "deploy: split (code $code)"; cat err "$WR_LOG"; }
+
+  # A same-body check with ignore: /p changes checked.at at each request. Equal when checked is ignored; v differs: rollback.
+  dproject d9c
+  printf '[deploy]\nurl = "%s"\nwait = 0\n\n[[deploy.smoke]]\npath = "/p"\nsame-body = true\nignore = ["/checked"]\n' "$BASE" > roc-cfw.toml
+  PATH=$DPATH "$CFW" deploy --message m >out 2>err; code=$?
+  [ $code = 0 ] && has out '^smoke ok   GET /p' && ok "deploy: same-body with ignore, a body that changes by itself passes" || { bad "deploy: ignore passes (code $code)"; cat out err; }
+  echo old > "$WR_STATE/live"; echo '{"p": "2"}' > "$WR_STATE/new.json"
+  PATH=$DPATH "$CFW" deploy --message m >out 2>err; code=$?
+  [ $code = 3 ] && has out 'smoke FAIL GET /p: the body is not the body before the deploy: it differs at /v' && ok "deploy: same-body with ignore, another difference fails" || { bad "deploy: ignore fails (code $code)"; cat out err; }
+  # An ignore list on a body that is not JSON: exit 1 before any change.
+  printf '[deploy]\nurl = "%s"\n\n[[deploy.smoke]]\npath = "/data"\nsame-body = true\nignore = ["/x"]\n' "$BASE" > roc-cfw.toml
+  echo old > "$WR_STATE/live"; rm -f "$WR_LOG"; touch "$WR_LOG"
+  PATH=$DPATH "$CFW" deploy >out 2>err; code=$?
+  [ $code = 1 ] && [ "$(cat "$WR_LOG")" = "deployments status --json" ] && has err 'GET /data: the body is not JSON, and the check has an ignore list' \
+    && ok "deploy: ignore on a body that is not JSON, exit 1, nothing changed" || { bad "deploy: ignore not JSON (code $code)"; cat err "$WR_LOG"; }
+  # --env with a url of [deploy] only: exit 2, nothing runs.
+  printf '[deploy]\nurl = "%s"\n\n[[deploy.smoke]]\npath = "/health"\n' "$BASE" > roc-cfw.toml
+  rm -f "$WR_LOG"; touch "$WR_LOG"
+  PATH=$DPATH "$CFW" deploy --env staging >out 2>err; code=$?
+  [ $code = 2 ] && [ ! -s "$WR_LOG" ] && has err 'Set url in \[deploy.env.staging\]' && ok "deploy: --env and only the url of [deploy], exit 2" || { bad "deploy: --env url (code $code)"; cat err; }
+  # [deploy.env.staging] gives the url: the checks use it.
+  printf '[deploy]\nurl = "https://wrong.invalid"\nwait = 0\n\n[[deploy.smoke]]\npath = "/health"\n\n[deploy.env.staging]\nurl = "%s"\n' "$BASE" > roc-cfw.toml
+  PATH=$DPATH "$CFW" deploy --env staging --message m >out 2>err; code=$?
+  [ $code = 0 ] && has out '^smoke ok   GET /health' && ok "deploy: [deploy.env.staging] url" || { bad "deploy: env url (code $code)"; cat out err; }
+  rm roc-cfw.toml
+
+  # The HTTP time limit: /slow answers after 3 s; --timeout 1 fails each try (rollback, exit 3).
+  dproject d9d
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke /slow --wait 0 --timeout 1 >out 2>err; code=$?
+  [ $code = 3 ] && has out 'smoke FAIL GET /slow: no answer' && ok "deploy: --timeout 1 on a slow answer fails" || { bad "deploy: --timeout (code $code)"; cat out err; }
+  # A before read tries 3 times: /flaky gives 503 once, then 200.
+  dproject d9e
+  PATH=$DPATH "$CFW" deploy --url "$BASE" --smoke-same /flaky --wait 0 --message m >out 2>err; code=$?
+  [ $code = 0 ] && has out '^smoke ok   GET /flaky' && ok "deploy: the before read tries again after a 503" || { bad "deploy: before read retry (code $code)"; cat out err; }
 
   # Upload with no version id: exit 1, no deploy call.
   dproject d10

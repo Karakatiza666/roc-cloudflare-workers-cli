@@ -13,7 +13,7 @@ Args :: [].{
 
 	## The version of this `roc-cfw` (the release tag). The default message of `deploy` has it.
 	version : Str
-	version = "0.0.2"
+	version = "0.0.3"
 
 	## The arguments after `node .roc-cfw/cli.mjs sync`. `file` is the app file of `roc-cfw` (`--file`, else `main.roc`).
 	## `cli.mjs sync` reads the app source with `--file` to warn of a handler that `Worker.new` does not list.
@@ -48,9 +48,11 @@ Args :: [].{
 		\\      Writes the template of the platform: the app body in main.roc, wrangler.toml, [scripts] in talon.toml, .gitignore.
 		\\  roc-cfw deploy [--file main.roc] [--js <dir>] [--wasm app.wasm] [--config <file>] [--env <name>] [--message <text>]
 		\\                 [--percent <1-100>] [--migrate <D1 binding>]... [--url <base>] [--smoke <path>[=<status>]]...
-		\\                 [--smoke-same <path>[=<status>]]... [--wait <seconds>] [--no-rollback] [--first] [--dry-run]
-		\\      Preflight (wasm age, sync --check), record the live version, D1 migrations, versions upload and deploy,
-		\\      smoke checks, rollback when a check fails. Settings also from [deploy] in roc-cfw.toml (docs/deploy.md).
+		\\                 [--smoke-same <path>[=<status>]]... [--wait <seconds>] [--timeout <seconds>] [--no-rollback]
+		\\                 [--first] [--dry-run]
+		\\      Preflight (wasm age, sync --check), record the live version, versions upload, D1 migrations (forward-only),
+		\\      versions deploy, smoke checks, rollback when a check fails. Settings also from [deploy] in roc-cfw.toml
+		\\      (docs/deploy.md).
 		\\  --js <dir>: use this directory in place of js/ of the platform (for the repository of the platform).
 		\\Exit: 0 good, 1 a failure, 2 a bad command line or an api of the platform that this version does not know.
 		\\deploy also: 3 a smoke check failed and the rollback passed, 4 a smoke check failed and the new version stays.
